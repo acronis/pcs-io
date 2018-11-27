@@ -1,0 +1,74 @@
+/*
+ * Copyright © 2003-2018 Acronis International GmbH.
+ */
+
+{
+	pcs_malloc tracepoints info
+	Memcheck:Leak
+	match-leak-kinds: reachable
+	...
+	fun:pcs_malloc_item_init_
+}
+
+{
+	pcs_process static initialisation
+	Memcheck:Leak
+	...
+	fun:pcs_process_init
+}
+
+{
+	pcs_co_filejob static initialisation
+	Memcheck:Leak
+	...
+	fun:pcs_co_filejob_init
+}
+
+{
+	A stack for signal handlers allocated by pcs_signal_set_fatal_handlers
+	Memcheck:Leak
+	...
+	fun:pcs_signal_set_fatal_handlers
+}
+
+{
+	A context of pcs logger exists as long as process is running
+	Memcheck:Leak
+	...
+	fun:pcs_set_logfile
+}
+
+{
+	OpenSSL static initialisation
+	Memcheck:Leak
+	...
+	fun:pcs_ssl_init
+}
+
+{
+	OpenSSL per-thread error state allocation
+	Memcheck:Leak
+	...
+	fun:ERR_get_state
+}
+
+{
+	OpenSSL per-thread initialisation of ex_data for bio and X509 (what's that?)
+	Memcheck:Leak
+	...
+	fun:def_get_class
+}
+
+{
+	OpenSSL per-thread initialisation of ex_data indices for bio and X509 (what's that?)
+	Memcheck:Leak
+	...
+	fun:int_get_new_index
+}
+
+{
+	OpenSSL BIO_METHOD for bufqueue
+	Memcheck:Leak
+	...
+	fun:sslsock_bio_method
+}

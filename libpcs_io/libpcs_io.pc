@@ -1,0 +1,14 @@
+/*
+ * Copyright © 2003-2018 Acronis International GmbH.
+ */
+
+prefix=/usr
+exec_prefix=/usr
+libdir=/usr/lib64
+includedir=${prefix}/include
+
+Name: libpcs_io
+Version: __VERSION
+Description: Vstorage core library
+Libs: -L${libdir} -lpcs_io -lz _PKG_CFG_LDFLAGS
+Cflags: -I${includedir}/pcs-core -I${includedir}/pcs-core/proto _PKG_CFG_CFLAGS
