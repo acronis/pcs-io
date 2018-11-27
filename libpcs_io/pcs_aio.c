@@ -39,7 +39,7 @@ pcs_thread_ret_t aio_worker(void * arg)
 	struct pcs_aio_worker * w = arg;
 	struct pcs_aio * aio = container_of(w - w->idx, struct pcs_aio, workers[0]);
 
-	pcs_thread_setname(pcs_thread_self(), "aio-worker");
+	pcs_thread_setname("aio-worker");
 
 	pthread_mutex_lock(&w->lock);
 	while (1) {

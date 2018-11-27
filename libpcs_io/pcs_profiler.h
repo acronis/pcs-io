@@ -8,7 +8,7 @@
 #include "pcs_config.h"
 #include "pcs_types.h"
 
-#if defined(HAVE_POSIX_TIMER) && !defined(PCS_PROFILER_DISABLE)
+#if defined(HAVE_POSIX_TIMER) && !defined(PCS_PROFILER_DISABLE) && !defined(PCS_THREAD_SANIT)
 #define PCS_USE_PROFILER 1
 #include <time.h>
 #include <signal.h>

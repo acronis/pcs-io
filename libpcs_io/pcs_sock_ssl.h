@@ -120,8 +120,6 @@ PCS_API X509* pcs_ssl_socket_get_peer_cert(struct pcs_co_file *sock);
    Perform a client-side handshake.
 
    \param @sock ssl socket
-   \param @timeout on entry, a timeout (in msecs) for the operation, NULL if infinite
-                   on exit, the remaining time
    \returns 0 if successful,
             PCS_ERR_SSL_CERTIFICATE_REVOKED if the client certificate is revoked
             PCS_ERR_SSL_CERTIFICATE_EXPIRED if the client certificate is expired
@@ -132,7 +130,7 @@ PCS_API X509* pcs_ssl_socket_get_peer_cert(struct pcs_co_file *sock);
             PCS_ERR_CANCELED if canceled with pcs_co_io_cancel()
             PCS_ERR_NET_ABORT or PCS_ERR_NET if there was a network error during the handshake
 */
-PCS_API int pcs_ssl_socket_co_connect(struct pcs_co_file *sock, int *timeout);
+PCS_API int pcs_ssl_socket_co_connect(struct pcs_co_file *sock);
 
 /**
    Perform a server-side handshake.
@@ -144,7 +142,7 @@ PCS_API int pcs_ssl_socket_co_connect(struct pcs_co_file *sock, int *timeout);
             PCS_ERR_CANCELED if canceled with pcs_co_io_cancel()
             PCS_ERR_NET_ABORT or PCS_ERR_NET if there was a network error during the handshake
 */
-PCS_API int pcs_ssl_socket_co_accept(struct pcs_co_file *sock, int *timeout);
+PCS_API int pcs_ssl_socket_co_accept(struct pcs_co_file *sock);
 
 /**
    Get last error text message. Helpful for connect/accept erorrs.

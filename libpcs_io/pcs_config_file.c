@@ -167,7 +167,7 @@ int pcs_parse_config_line(struct pcs_config* cfg, char* buf)
 	return 0;
 }
 
-#define BUFF_SZ 512
+#define BUFF_SZ (1024)
 
 /* Parse configuration file */
 int pcs_parse_config_file(struct pcs_config* cfg, FILE *f)

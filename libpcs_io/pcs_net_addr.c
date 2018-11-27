@@ -409,11 +409,9 @@ int _co_parse_netaddr_port_multi(void *_args)
 	return pcs_parse_netaddr_port_multi(args->str, args->def_port, args->nr_addrs, args->addrs);
 }
 
-int pcs_co_parse_netaddr_port_multi(const char *str, const char *def_port, int *nr_addrs, PCS_NET_ADDR_T **addrs, int *timeout)
+int pcs_co_parse_netaddr_port_multi(const char *str, const char *def_port, int *nr_addrs, PCS_NET_ADDR_T **addrs)
 {
-	/* FIXME: implement pcs_co_io_cancel()-friendly timeout handling */
-	(void) timeout;
-
+	/* FIXME: implement context cancelation support */
 	struct _co_parse_netaddr_port_multi_args args = {
 		.str = str,
 		.def_port = def_port,
@@ -423,13 +421,13 @@ int pcs_co_parse_netaddr_port_multi(const char *str, const char *def_port, int *
 	return pcs_co_filejob(pcs_current_proc->co_io, &_co_parse_netaddr_port_multi, &args);
 }
 
-int pcs_co_parse_netaddr_port(const char *str, const char *def_port, PCS_NET_ADDR_T *addr, int *timeout)
+int pcs_co_parse_netaddr_port(const char *str, const char *def_port, PCS_NET_ADDR_T *addr)
 {
 	PCS_NET_ADDR_T *addrs;
 	int nr_addrs;
 	int res;
 
-	if ((res = pcs_co_parse_netaddr_port_multi(str, def_port, &nr_addrs, &addrs, timeout)))
+	if ((res = pcs_co_parse_netaddr_port_multi(str, def_port, &nr_addrs, &addrs)))
 		return res;
 
 	*addr = addrs[0];
@@ -437,9 +435,9 @@ int pcs_co_parse_netaddr_port(const char *str, const char *def_port, PCS_NET_ADD
 	return 0;
 }
 
-int pcs_co_parse_netaddr(const char *str, PCS_NET_ADDR_T *addr, int *timeout)
+int pcs_co_parse_netaddr(const char *str, PCS_NET_ADDR_T *addr)
 {
-	return pcs_co_parse_netaddr_port(str, NULL, addr, timeout);
+	return pcs_co_parse_netaddr_port(str, NULL, addr);
 }
 
 const char *pcs_parse_netaddr_err(int err_code)

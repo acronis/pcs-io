@@ -13,6 +13,42 @@
 #include "log.h"
 #include "pcs_atomic.h"
 
+#ifdef _USE_TCMALLOC
+
+#include "pcs_winapi.h"
+
+#define tc_malloc tc_mallocPtr
+#define tc_realloc tc_reallocPtr
+#define tc_free tc_freePtr
+
+static char *tc_strdup(const char *src)
+{
+	size_t size = strlen(src) + 1;
+	char *ptr = tc_malloc(size);
+	if (likely(ptr))
+		memcpy(ptr, src, size);
+	return ptr;
+}
+
+static char *tc_strndup(const char *src, size_t size)
+{
+	size = strnlen(src, size) + 1;
+	char *ptr = tc_malloc(size);
+	if (likely(ptr)) {
+		memcpy(ptr, src, size - 1);
+		ptr[size - 1] = '\0';
+	}
+	return ptr;
+}
+
+#define malloc tc_malloc
+#define realloc tc_realloc
+#define free tc_free
+#define strdup tc_strdup
+#define strndup tc_strndup
+
+#endif // _USE_TCMALLOC
+
 void __noinline pcs_malloc_failed(const char *file)
 {
 	pcs_log(LOG_ERR, "Fatal: failed to allocate memory at %s", file);
@@ -33,14 +69,8 @@ void pcs_malloc_debug_enable(void)
 	pcs_malloc_enabled = 1;
 }
 
-static void pcs_malloc_item_init(struct malloc_item **tr, const char *file)
+static void pcs_account_alloc_locked(struct malloc_item *mi, intptr_t size)
 {
-	pcs_malloc_item_init_(tr, file, 0);
-}
-
-void pcs_account_alloc(struct malloc_item *mi, intptr_t size)
-{
-	pthread_mutex_lock(&mi->mutex);
 	BUG_ON(-size > (intptr_t)mi->allocated);
 	mi->allocated += size;
 	if (size > 0) {
@@ -53,6 +83,12 @@ void pcs_account_alloc(struct malloc_item *mi, intptr_t size)
 	if (size < 0) {
 		++mi->free_cnt;
 	}
+}
+
+void pcs_account_alloc(struct malloc_item *mi, intptr_t size)
+{
+	pthread_mutex_lock(&mi->mutex);
+	pcs_account_alloc_locked(mi, size);
 	pthread_mutex_unlock(&mi->mutex);
 }
 
@@ -63,7 +99,7 @@ void pcs_account_alloc(struct malloc_item *mi, intptr_t size)
 #define MI_HASH_SIZE	32768
 static struct malloc_item *mi_hash[MI_HASH_SIZE];
 
-static struct malloc_item *hash_lookup(u32 hash, const char *file)
+__no_sanitize_thread static struct malloc_item *hash_lookup(u32 hash, const char *file)
 {
 	volatile struct malloc_item *mi;
 	for (mi = mi_hash[hash]; mi; mi = mi->hash_next)
@@ -72,20 +108,18 @@ static struct malloc_item *hash_lookup(u32 hash, const char *file)
 	return NULL;
 }
 
-void pcs_malloc_item_init_(struct malloc_item **p_mi, const char *file, u32 flags)
+struct malloc_item *pcs_malloc_item_init(struct malloc_item **p_mi, const char *file, u32 flags)
 {
-	if (unlikely(!pcs_malloc_enabled)) {
-		*p_mi = NULL;
-		return;
-	}
+	if (unlikely(!pcs_malloc_enabled))
+		return NULL;
 
 	/* fast path: it's ok to walk through hash table w/o mutex as we never remove items from it */
 	u32 hash = jhash3((u32)(((ULONG_PTR)file) >> 3), (u32)((ULONG_PTR)file), (u32)(((ULONG_PTR)file) >> 24), *(u32*)file);
 	hash &= (MI_HASH_SIZE - 1);
 	struct malloc_item *mi = hash_lookup(hash, file);
 	if (likely(mi)) {
-		*p_mi = mi;
-		return;
+		__tsan_acquire(p_mi);
+		return mi;
 	}
 
 	struct malloc_item *new_mi = malloc(sizeof(struct malloc_item));
@@ -110,27 +144,44 @@ void pcs_malloc_item_init_(struct malloc_item **p_mi, const char *file, u32 flag
 		mi_list = mi;
 		mi->hash_next = mi_hash[hash];
 		pcs_wmb();
+		__tsan_release(p_mi);
 		mi_hash[hash] = mi;
+	} else {
+		__tsan_acquire(p_mi);
 	}
 	pthread_mutex_unlock(&global_mutex);
 	free(new_mi);
 
-	*p_mi = mi;
+	return mi;
 }
 
 #else	/* TRACE_ALLOC_SLOW */
 
-void pcs_malloc_item_init_(struct malloc_item **pointer, const char *file, u32 flags)
+__no_sanitize_thread static struct malloc_item *get_malloc_item(struct malloc_item **p_mi)
 {
-	if (likely(*pointer) || unlikely(!pcs_malloc_enabled))
-		return;
+	return *p_mi;
+}
 
-	struct malloc_item *mi = malloc(sizeof(struct malloc_item));
-	if (unlikely(!mi))
+struct malloc_item *pcs_malloc_item_init(struct malloc_item **p_mi, const char *file, u32 flags)
+{
+	struct malloc_item *mi = get_malloc_item(p_mi);
+	if (likely(mi)) {
+		__tsan_acquire(p_mi);
+		return mi;
+	}
+
+	if (unlikely(!pcs_malloc_enabled))
+		return NULL;
+
+	struct malloc_item *new_mi = malloc(sizeof(struct malloc_item));
+	if (unlikely(!new_mi))
 		pcs_malloc_failed(file);
 
 	pthread_mutex_lock(&global_mutex);
-	if (unlikely(*pointer == NULL)) {
+	mi = get_malloc_item(p_mi);
+	if (likely(!mi)) {
+		mi = new_mi;
+		new_mi = NULL;
 		mi->allocated = 0;
 		mi->max_size  = 0;
 		mi->max_allocated = 0;
@@ -141,29 +192,32 @@ void pcs_malloc_item_init_(struct malloc_item **pointer, const char *file, u32 f
 		mi->flags = flags;
 		pthread_mutex_init(&mi->mutex, NULL);
 		mi_list = mi;
-		*pointer = mi;
-		mi = NULL;
+		pcs_wmb();
+		__tsan_release(p_mi);
+		*p_mi = mi;
+	} else {
+		__tsan_acquire(p_mi);
 	}
 	pthread_mutex_unlock(&global_mutex);
-	free(mi);
-}
+	free(new_mi);
 
+	return mi;
+}
 #endif	/* TRACE_ALLOC_SLOW */
 
-void *__pcs_malloc(struct malloc_item *mi, const char *file, int check, size_t size)
+void *__pcs_malloc(struct malloc_item **p_mi, const char *file, int check, size_t size)
 {
 	void *ptr = NULL;
 	if (unlikely(!pcs_malloc_enabled)) {
 		ptr = malloc(size);
 		goto done;
 	}
-	if (unlikely(!mi))
-		pcs_malloc_item_init(&mi, file);
 
 	struct mem_header *hdr = malloc(size + sizeof(struct mem_header));
 	if (unlikely(!hdr))
 		goto done;
 
+	struct malloc_item *mi = pcs_malloc_item_init(p_mi, file, 0);
 	pcs_account_alloc(mi, size);
 	pcs_fill_mem_header(hdr, mi, size);
 	ptr = hdr + 1;
@@ -174,15 +228,15 @@ done:
 	return ptr;
 }
 
-void *__pcs_zmalloc(struct malloc_item *mi, const char *file, int check, size_t size)
+void *__pcs_zmalloc(struct malloc_item **p_mi, const char *file, int check, size_t size)
 {
-	void *ptr = __pcs_malloc(mi, file, check, size);
+	void *ptr = __pcs_malloc(p_mi, file, check, size);
 	if (likely(ptr))
 		memset(ptr, 0, size);
 	return ptr;
 }
 
-void *__pcs_realloc(struct malloc_item *mi, const char *file, int check, void *block, size_t size)
+void *__pcs_realloc(struct malloc_item **p_mi, const char *file, int check, void *block, size_t size)
 {
 	void *ptr = NULL;
 
@@ -190,10 +244,8 @@ void *__pcs_realloc(struct malloc_item *mi, const char *file, int check, void *b
 		ptr = realloc(block, size);
 		goto done;
 	}
-	if (unlikely(!mi))
-		pcs_malloc_item_init(&mi, file);
 	if (unlikely(!block))
-		return __pcs_malloc(mi, file, check, size);
+		return __pcs_malloc(p_mi, file, check, size);
 	if (unlikely(!size)) {
 		__pcs_free(block);
 		return NULL;
@@ -207,7 +259,7 @@ void *__pcs_realloc(struct malloc_item *mi, const char *file, int check, void *b
 
 	intptr_t init_size = pcs_get_size(hdr->size);
 
-	mi = hdr->caller;
+	struct malloc_item *mi = hdr->caller;
 
 	hdr = realloc ((void*) hdr, size + sizeof(struct mem_header));
 	if (unlikely(!hdr))
@@ -258,59 +310,48 @@ void __pcs_alloc_account(void *block, ptrdiff_t size)
 		return;
 
 	struct mem_header* hdr = (struct mem_header*)block - 1;
+	struct malloc_item *mi = hdr->caller;
 
+	pthread_mutex_lock(&mi->mutex);
 	BUG_ON(size < 0 && hdr->size < -size);
 	hdr->size += size;
-	pcs_account_alloc(hdr->caller, size);
+	pcs_account_alloc_locked(mi, size);
+	pthread_mutex_unlock(&mi->mutex);
 }
 
-char *__pcs_strdup(struct malloc_item *mi, const char *file, int check, const char *src)
+char *__pcs_strdup(struct malloc_item **p_mi, const char *file, int check, const char *src)
 {
 	char *ptr = NULL;
 	if (unlikely(!pcs_malloc_enabled)) {
 		ptr = strdup(src);
-		goto done;
+		if (unlikely(check && !ptr))
+			pcs_malloc_failed(file);
+		return ptr;
 	}
-	if (unlikely(!mi))
-		pcs_malloc_item_init(&mi, file);
 
 	size_t size = strlen(src) + 1;
-	struct mem_header* hdr = malloc (size + sizeof(struct mem_header));
-	if (unlikely(!hdr))
-		goto done;
-	pcs_account_alloc(mi, size);
-	pcs_fill_mem_header(hdr, mi, size);
-	hdr++;
-	ptr = memcpy(hdr, src, size);
-done:
-	if (unlikely(check && !ptr))
-		pcs_malloc_failed(file);
+	ptr = __pcs_malloc(p_mi, file, check, size);
+	if (likely(ptr))
+		memcpy(ptr, src, size);
 	return ptr;
 }
 
-char *__pcs_strndup(struct malloc_item *mi, const char *file, int check, const char *src, size_t size)
+char *__pcs_strndup(struct malloc_item **p_mi, const char *file, int check, const char *src, size_t size)
 {
 	char *ptr = NULL;
 	if (unlikely(!pcs_malloc_enabled)) {
 		ptr = strndup(src, size);
-		goto done;
+		if (unlikely(check && !ptr))
+			pcs_malloc_failed(file);
+		return ptr;
 	}
-	if (unlikely(!mi))
-		pcs_malloc_item_init(&mi, file);
 
-	size_t len = strnlen(src, size);
-	size = ((len < size) ? len : size) + 1;
-	struct mem_header* hdr = malloc (size + sizeof(struct mem_header));
-	if (unlikely(!hdr))
-		goto done;
-	pcs_account_alloc(mi, size);
-	pcs_fill_mem_header(hdr, mi, size);
-	hdr++;
-	ptr = memcpy(hdr, src, size - 1);
-	ptr[size - 1] = '\0';
-done:
-	if (unlikely(check && !ptr))
-		pcs_malloc_failed(file);
+	size = strnlen(src, size) + 1;
+	ptr = __pcs_malloc(p_mi, file, check, size);
+	if (likely(ptr)) {
+		memcpy(ptr, src, size - 1);
+		ptr[size - 1] = '\0';
+	}
 	return ptr;
 }
 
@@ -378,7 +419,7 @@ int pcs_malloc_for_each_item(void (*fn)(struct malloc_item *p))
 	return 0;
 }
 
-char *__pcs_vasprintf(struct malloc_item *mi, const char *file, int check, const char *fmt, va_list va)
+char *__pcs_vasprintf(struct malloc_item **p_mi, const char *file, int check, const char *fmt, va_list va)
 {
 	va_list va2;
 	va_copy(va2, va);
@@ -387,8 +428,8 @@ char *__pcs_vasprintf(struct malloc_item *mi, const char *file, int check, const
 	if (len < 0)
 		return NULL;
 
-	char *s = __pcs_malloc(mi, file, check, len + 1);
-	if (!s)
+	char *s = __pcs_malloc(p_mi, file, check, len + 1);
+	if (unlikely(!s))
 		return NULL;
 
 	if (vsnprintf(s, len + 1, fmt, va) != len)
@@ -397,11 +438,11 @@ char *__pcs_vasprintf(struct malloc_item *mi, const char *file, int check, const
 	return s;
 }
 
-char *__pcs_asprintf(struct malloc_item *mi, const char *file, int check, const char *fmt, ...)
+char *__pcs_asprintf(struct malloc_item **p_mi, const char *file, int check, const char *fmt, ...)
 {
 	va_list va;
 	va_start(va, fmt);
-	char *s = __pcs_vasprintf(mi, file, check, fmt, va);
+	char *s = __pcs_vasprintf(p_mi, file, check, fmt, va);
 	va_end(va);
 	return s;
 }

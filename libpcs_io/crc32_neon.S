@@ -1,7 +1,3 @@
-/*
- * Copyright © 2003-2018 Acronis International GmbH.
- */
-
 #ifdef __aarch64__
 
 	.text

@@ -67,6 +67,7 @@ struct pcs_process
 	pthread_mutex_t		remote_job_mutex;
 	struct cd_list		remote_job_queue;
 	struct pcs_event_ioconn	*remote_job_event;
+	pcs_atomic32_t		remote_job_present;
 
 	/* coroutines */
 	pthread_mutex_t		co_list_mutex;		/* protects co_list and co_pool */
@@ -92,6 +93,7 @@ struct pcs_process
 
 struct pcs_evloop {
 	pcs_thread_t	thr;
+	unsigned long	thr_id;
 
 	struct pcs_process  *proc;
 

@@ -85,10 +85,12 @@ __asm__(".global pcs_ucontext_trampoline\n"
 void pcs_ucontext_init(struct pcs_ucontext *context, void *stack, u32 stack_sz, void (*func)(void*), void *arg)
 {
 	void **sp = stack + stack_sz;
-	BUG_ON((ULONG_PTR)sp & 0xF);
+	BUG_ON((ULONG_PTR)sp & 7);
 
-	*(--sp) = 0;
-	*(--sp) = 0;
+	if (!((ULONG_PTR)sp & 8)) {
+		*(--sp) = 0;
+		*(--sp) = 0;
+	}
 	*(--sp) = 0;
 	*(--sp) = arg;
 	*(--sp) = 0;
@@ -116,7 +118,7 @@ void pcs_ucontext_switch(struct pcs_ucontext *save, struct pcs_ucontext *load)
 
 #include <ucontext.h>
 
-#ifdef PCS_ADDRESS_SANITIZER
+#ifdef PCS_ADDR_SANIT
 #include <sanitizer/lsan_interface.h>
 #endif
 
@@ -162,7 +164,7 @@ static void _context_start(int arg0, int arg1)
 	void (*func)(void*) = context_arg->func;
 	void *arg = context_arg->arg;
 
-#ifdef PCS_ADDRESS_SANITIZER
+#ifdef PCS_ADDR_SANIT
 	const void *stack_bottom;
 	size_t stack_size;
 	__sanitizer_finish_switch_fiber(NULL, &stack_bottom, &stack_size);
@@ -203,7 +205,7 @@ void pcs_ucontext_init(struct pcs_ucontext *context, void *stack, u32 stack_sz, 
 	/* prepare context for _coroutine_start */
 	makecontext(&uc1, (void (*)(void))_context_start, 2, helper_arg.data32[0], helper_arg.data32[1]);
 
-#ifdef PCS_ADDRESS_SANITIZER
+#ifdef PCS_ADDR_SANIT
 	void *fake_stack;
 	__sanitizer_start_switch_fiber(&fake_stack, stack + stack_sz, stack_sz);
 #endif
@@ -211,7 +213,7 @@ void pcs_ucontext_init(struct pcs_ucontext *context, void *stack, u32 stack_sz, 
 		swapcontext(&uc2, &uc1);
 		BUG();
 	}
-#ifdef PCS_ADDRESS_SANITIZER
+#ifdef PCS_ADDR_SANIT
 	__sanitizer_finish_switch_fiber(fake_stack, NULL, NULL);
 #endif
 }

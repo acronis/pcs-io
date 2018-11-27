@@ -22,7 +22,7 @@ struct iovec;
 
 struct pcs_co_file {
 	pcs_fd_t		fd;
-	struct pcs_co_file_ops	*ops;
+	const struct pcs_co_file_ops *ops;
 	void			*priv;	/* user data */
 #ifdef __WINDOWS__
 	u8			skip_sync_notify;
@@ -47,22 +47,26 @@ static inline pcs_sock_t pcs_co_file_sock(struct pcs_co_file *file) { return (pc
 #define CO_IO_NOWAIT  2	/* sock/pipe: don't wait for I/O, return what is available. Can return 0 bytes. */
 
 struct pcs_co_file_ops {
-	int (*read)(struct pcs_co_file *file, void *buf, int size, u64 offset, int *timeout, u32 flags);
-	int (*write)(struct pcs_co_file *file, const void * buf, int size, u64 offset, int * timeout, u32 flags);
+	int (*read)(struct pcs_co_file *file, void *buf, int size, u64 offset, u32 flags);
+	int (*write)(struct pcs_co_file *file, const void * buf, int size, u64 offset, u32 flags);
+
+	int (*readv)(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u64 offset, u32 flags);
+	int (*writev)(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u64 offset, u32 flags);
+
 	int (*close)(struct pcs_co_file *file);
 };
 
-void pcs_co_file_init(struct pcs_co_file *file, struct pcs_co_file_ops *ops); /* NOTE: doesn't init @file->ioconn */
-PCS_API struct pcs_co_file *pcs_co_file_alloc_regular(pcs_fd_t fd);
+void pcs_co_file_init(struct pcs_co_file *file, struct pcs_co_file_ops *ops);
+PCS_API struct pcs_co_file *pcs_co_file_alloc_regular(pcs_fd_t fd, int flag);	/* flag is the same as in open() */
 PCS_API struct pcs_co_file *pcs_co_file_alloc_socket(pcs_sock_t sock);
 
 /* --------------------------------------------------------------------------------- */
 
 #define PCS_CO_FREE_BIND 1
 PCS_API int pcs_co_listen(PCS_NET_ADDR_T * na, int flags, struct pcs_co_file ** listen_out);
-PCS_API int pcs_co_accept(struct pcs_co_file *listen, PCS_NET_ADDR_T * na, struct pcs_co_file ** file_out, int * timeout);
+PCS_API int pcs_co_accept(struct pcs_co_file *listen, PCS_NET_ADDR_T * na, struct pcs_co_file ** file_out);
 
-PCS_API int pcs_co_connect(PCS_NET_ADDR_T * na, struct pcs_co_file ** file_out, int * timeout);
+PCS_API int pcs_co_connect(PCS_NET_ADDR_T * na, struct pcs_co_file ** file_out);
 
 PCS_API int pcs_co_file_open(const char * pathname, int flag, int mode, struct pcs_co_file ** out_file);
 PCS_API int pcs_co_file_openat(struct pcs_co_file * dir, const char * pathname, int flag, int mode, struct pcs_co_file ** out_file);
@@ -76,18 +80,13 @@ PCS_API int pcs_co_file_pipe(struct pcs_co_file ** in_file, struct pcs_co_file *
 /* NOTE: offset is ignored on socket/pipe */
 PCS_API int pcs_co_file_read(struct pcs_co_file *file, void * buf, int size, u64 offset);
 PCS_API int pcs_co_file_write(struct pcs_co_file *file, const void * buf, int size, u64 offset);
+PCS_API int pcs_co_file_readv(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u64 offset);
+PCS_API int pcs_co_file_writev(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u64 offset);
 
-PCS_API int pcs_co_file_read_ex(struct pcs_co_file *file, void * buf, int size, u64 offset, int * timeout, u32 flags);
-PCS_API int pcs_co_file_write_ex(struct pcs_co_file *file, const void * buf, int size, u64 offset, int * timeout, u32 flags);
-
-/* --------------------------------------------------------------------------------- */
-
-/* May be unsuppoted on some platforms. On Windows API is limited to files opened with O_DIRECT.
- * Result of execution (number of bytes or negative pcs error) is reported to callback */
-PCS_API int pcs_preadv_supported(void);
-
-PCS_API void pcs_co_file_readv_async(struct pcs_co_file *file, const struct iovec *iov, int iovcnt, u64 offset, void (*cb)(void *arg, int res), void *arg);
-PCS_API void pcs_co_file_writev_async(struct pcs_co_file *file, const struct iovec *iov, int iovcnt, u64 offset, void (*cb)(void *arg, int res), void *arg);
+PCS_API int pcs_co_file_read_ex(struct pcs_co_file *file, void * buf, int size, u32 flags);
+PCS_API int pcs_co_file_write_ex(struct pcs_co_file *file, const void * buf, int size, u32 flags);
+PCS_API int pcs_co_file_readv_ex(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u32 flags);
+PCS_API int pcs_co_file_writev_ex(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u32 flags);
 
 /* --------------------------------------------------------------------------------- */
 
@@ -115,12 +114,12 @@ PCS_API int pcs_co_statvfs(const char * path, struct pcs_statvfs * res);
 PCS_API int pcs_co_fstatvfs(pcs_fd_t fd, struct pcs_statvfs * res);
 
 /*
-  A version of pcs_co_wait_timeout() that puts a caller coroutine in a cancellable sleep. See pcs_co_io_cancel().
+  A version of pcs_co_wait_timeout() that puts a caller coroutine in a cancelable sleep. See pcs_co_io_cancel().
   If canceled, returns -PCS_CO_CANCELED, and zeroes out @timeout.
 */
-PCS_API int pcs_co_io_wait_cancellable(int *timeout);
+PCS_API int pcs_co_io_wait_cancelable(int *timeout);
 /* Add a caller coroutine as a waiter to @wq, and sleep cancellably waiting for an event. */
-PCS_API int pcs_co_io_wait_cancellable_wq(struct pcs_co_waitqueue *wq, int *timeout);
+PCS_API int pcs_co_io_wait_cancelable_wq(struct pcs_co_waitqueue *wq, int *timeout);
 
 void pcs_co_file_pool_free(struct pcs_process *proc);
 

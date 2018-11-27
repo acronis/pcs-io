@@ -317,6 +317,21 @@ typedef BOOL (__stdcall *PQueryUnbiasedInterruptTime)(
 
 extern PQueryUnbiasedInterruptTime QueryUnbiasedInterruptTimePtr;
 
+typedef HRESULT (__stdcall *PSetThreadDescription)(
+	HANDLE hThread,
+	PCWSTR lpThreadDescription
+	);
+
+extern PSetThreadDescription SetThreadDescriptionPtr;
+
+typedef void *(*Ptc_malloc)(size_t size);
+typedef void *(*Ptc_realloc)(void* ptr, size_t size);
+typedef void (*Ptc_free)(void* ptr);
+
+extern Ptc_malloc tc_mallocPtr;
+extern Ptc_realloc tc_reallocPtr;
+extern Ptc_free tc_freePtr;
+
 int pcs_winapi_init(void);
 
 #endif /* __WINDOWS__ */

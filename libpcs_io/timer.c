@@ -39,13 +39,6 @@ static abs_time_t time_skew_mask;
 #define _POSIX_MONOTONIC_CLOCK 1
 #endif
 
-#ifndef _TIMESPEC_DEFINED
-struct timespec {
-	time_t  tv_sec;        /* seconds */
-	long    tv_nsec;       /* nanoseconds */
-};
-#endif
-
 // Note: some broken versions only have 8 trailing zero's, the correct epoch has 9 trailing zero's
 static const uint64_t EPOCH = ((uint64_t)116444736000000000ULL);
 
@@ -238,7 +231,7 @@ static inline int timer_cmp(struct rb_node *node, ULONG_PTR key)
 	return 0;
 }
 
-static void __mod_timer(struct pcs_timer *timer, struct pcs_timer_tree *timers, abs_time_t now, time_diff_t timeout)
+static void __mod_timer(struct pcs_timer *timer, struct pcs_timer_tree *timers, abs_time_t expires)
 {
 	if (timer->expires) {
 		/* if armed, remove first */
@@ -247,7 +240,7 @@ static void __mod_timer(struct pcs_timer *timer, struct pcs_timer_tree *timers, 
 		cd_list_del(&timer->list);
 	}
 
-	timer->expires = timeout > 0 ? now + timeout : now;
+	timer->expires = expires;
 	rb_insert_node(&timers->root, &timer->node, timer_cmp, (ULONG_PTR)&timer->expires);
 }
 
@@ -282,9 +275,11 @@ void mod_timer(struct pcs_timer *timer, time_diff_t timeout)
 		now = this_evloop->last_abs_time_ms;
 	}
 
+	abs_time_t expires = timeout > 0 ? now + timeout : now;
+
 	if (this_evloop->proc->nr_evloops == 1) {
 		/* no sync for single-threaded app */
-		__mod_timer(timer, &this_evloop->timers, now, timeout);
+		__mod_timer(timer, &this_evloop->timers, expires);
 		return;
 	}
 
@@ -308,7 +303,7 @@ restart:;
 		if (likely(evloop == this_evloop) || unlikely(evloop->timers.exec_timer == timer)) {
 			/* If timer function is running in another eventloop,
 			 * reschedule timer in the same eventloop to avoid waiting for its completion */
-			 __mod_timer(timer, &evloop->timers, now, timeout);
+			 __mod_timer(timer, &evloop->timers, expires);
 		 	pthread_mutex_unlock(&evloop->timers.lock);
 			break;
 		}

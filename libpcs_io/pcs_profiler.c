@@ -92,10 +92,14 @@ static void profile_action(int signo, siginfo_t * si, void * ctx)
 		return;
 	}
 
-#ifdef __x86_64__
+#if defined(__aarch64__)
+	pc = (u64)uc->uc_mcontext.pc;
+#elif defined(__x86_64__)
 	pc = (u64)uc->uc_mcontext.gregs[REG_RIP];
-#else
+#elif defined(__i386__)
 	pc = (u64)uc->uc_mcontext.gregs[REG_EIP];
+#else
+#error "Unsupported architecture"
 #endif
 
 	cb = prof->priv_cb;

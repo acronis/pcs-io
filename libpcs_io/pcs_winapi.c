@@ -20,6 +20,35 @@ PSetFileCompletionNotificationModes SetFileCompletionNotificationModesPtr;
 
 PGetSystemTimePreciseAsFileTime GetSystemTimePreciseAsFileTimePtr;
 PQueryUnbiasedInterruptTime QueryUnbiasedInterruptTimePtr;
+PSetThreadDescription SetThreadDescriptionPtr;
+
+Ptc_malloc tc_mallocPtr;
+Ptc_realloc tc_reallocPtr;
+Ptc_free tc_freePtr;
+
+// Copy-paste from VersionHelpers.h Win8.1 SDK
+//   (GetVersion* functions are deprecated starting with Win8.1 - see https://docs.microsoft.com/en-us/windows/desktop/api/sysinfoapi/nf-sysinfoapi-getversion)
+FORCEINLINE BOOL IsWindowsVersionOrGreater(WORD wMajorVersion, WORD wMinorVersion, WORD wServicePackMajor)
+{
+	OSVERSIONINFOEXW osvi = { sizeof(osvi), 0, 0, 0, 0, { 0 }, 0, 0 };
+	DWORDLONG        const dwlConditionMask = VerSetConditionMask(
+		VerSetConditionMask(
+		VerSetConditionMask(
+		0, VER_MAJORVERSION, VER_GREATER_EQUAL),
+		VER_MINORVERSION, VER_GREATER_EQUAL),
+		VER_SERVICEPACKMAJOR, VER_GREATER_EQUAL);
+
+	osvi.dwMajorVersion = wMajorVersion;
+	osvi.dwMinorVersion = wMinorVersion;
+	osvi.wServicePackMajor = wServicePackMajor;
+
+	return VerifyVersionInfoW(&osvi, VER_MAJORVERSION | VER_MINORVERSION | VER_SERVICEPACKMAJOR, dwlConditionMask) != FALSE;
+}
+
+FORCEINLINE BOOL IsWindowsVistaOrGreater()
+{
+	return IsWindowsVersionOrGreater(HIBYTE(_WIN32_WINNT_VISTA), LOBYTE(_WIN32_WINNT_VISTA), 0);
+}
 
 int pcs_winapi_init(void)
 {
@@ -57,6 +86,23 @@ int pcs_winapi_init(void)
 
 	LOAD_OPTIONAL(kern_module, GetSystemTimePreciseAsFileTime);
 	LOAD_OPTIONAL(kern_module, QueryUnbiasedInterruptTime);
+	LOAD_OPTIONAL(kern_module, SetThreadDescription);
+
+	tc_mallocPtr = &malloc;
+	tc_reallocPtr = &realloc;
+	tc_freePtr = &free;
+
+#ifdef _USE_TCMALLOC
+	// tcmalloc library uses static TLS that is not supported along with dynamic library loading in Win XP/2003
+	if (IsWindowsVistaOrGreater()) {
+		HMODULE tcmalloc_module = LoadLibraryExW(L"tcmalloc.dll", 0, LOAD_WITH_ALTERED_SEARCH_PATH);
+		if (tcmalloc_module) {
+			LOAD(tcmalloc_module, tc_malloc);
+			LOAD(tcmalloc_module, tc_realloc);
+			LOAD(tcmalloc_module, tc_free);
+		}
+	}
+#endif
 
 	rc = 0;
 	return rc;

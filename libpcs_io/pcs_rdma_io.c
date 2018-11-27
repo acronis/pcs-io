@@ -5,6 +5,7 @@
 #include <string.h>
 #include <errno.h>
 
+#include "log.h"
 #include "pcs_types.h"
 #include "pcs_sock_io.h"
 #include "pcs_rdma_io.h"
@@ -12,7 +13,6 @@
 #include "pcs_poll.h"
 #include "pcs_malloc.h"
 #include "pcs_mr_malloc.h"
-#include "log.h"
 
 #include <rdma/rdma_verbs.h>
 
@@ -700,7 +700,6 @@ static int rio_handle_rx_immediate(struct pcs_rdmaio *rio, char *buf, int len,
 {
 	struct pcs_msg *msg;
 	int offset = rio->hdr_size;
-	int leftover = 0;
 
 	if (len < rio->hdr_size) {
 		pcs_log(LOG_ERR, "rio read short msg: %d < %d", len, rio->hdr_size);
@@ -731,17 +730,12 @@ static int rio_handle_rx_immediate(struct pcs_rdmaio *rio, char *buf, int len,
 		/* Yeah... mr_buf is useless if payload is sent w/o RDMA */
 		unwind_mr_buf(&body, &body_len);
 
-		if (body_len > len - offset) {
-			leftover = body_len - (len - offset);
+		if (body_len > len - offset)
 			body_len = len - offset;
-		}
 
 		memcpy(body, buf + offset, body_len);
 		offset += body_len;
 	}
-
-	/* handling non-zero leftover is doable but hard; postpone it until really needed */
-	BUG_ON(len != msg->size && leftover);
 
 	if (len == msg->size)
 		msg->done(msg);

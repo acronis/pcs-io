@@ -11,6 +11,7 @@
 #include "pcs_types.h"
 #include "pcs_profiler.h"
 #include "log.h"
+#include "logrotate.h"
 #include "crc32.h"
 
 #include <stdio.h>
@@ -47,7 +48,7 @@ LPTOP_LEVEL_EXCEPTION_FILTER old_fatal_handler = NULL;
 #include <sys/time.h>
 #include <unistd.h>
 #endif /* __WINDOWS__ */
-#ifdef PCS_ADDRESS_SANITIZER
+#ifdef PCS_ADDR_SANIT
 #include <sanitizer/lsan_interface.h>
 #endif
 
@@ -100,6 +101,10 @@ struct zst_wrap {
 		fprintf(stderr,  "%s: ERROR (" __FILE__ ":" __xstr(__LINE__) "): ", time_buff); \
 		fprintf(stderr,  __VA_ARGS__); \
 	} while (0)
+#define ARRAY_SIZE(a)  (sizeof(a) / sizeof(*(a)))
+
+const char log_level_names[] = {'E', 'W', 'I', 'T', 'T', 'T', 'T', 'D', 'D'};
+BUILD_BUG_ON(ARRAY_SIZE(log_level_names) != LOG_LEVEL_MAX);
 
 struct log_buff {
 	char		buff[LOG_BUFF_SZ];
@@ -111,10 +116,8 @@ struct log_buff {
 struct log_writer {
 	/* The current filename */
 	char*		fname;
-	/* Extension. If compact timestamps are not used it can be .log, .gz and .zst,
-	 * otherwise - .log, .log.gz and .log.zst */
-	char		ext[9];
-	char*		basename;
+	int             lflags; 
+
 	/* The lock file descriptor */
 	pcs_fd_t	lock_fd;
 	/* The file descriptor */
@@ -135,15 +138,6 @@ struct log_writer {
 	/* Current log on-disk size */
 	long long 	log_size;
 
-	/* Rotation stuff */
-	pcs_log_rotate_t rotate_mode;
-	long long	rotate_threshold;
-	unsigned	rotate_filenum;
-	int		rotate_request;
-
-	/* when we start each new log file */
-	abs_time_t	ts_low;
-
 	/* Termination request */
 	int		close_request;
 
@@ -156,6 +150,8 @@ struct log_writer {
 	void (*write_buff)(struct log_writer* l, struct log_buff* b);
 	void (*close_log)(struct log_writer* l);
 	int (*reopen_log)(struct log_writer* l);
+
+	struct logrotate	rotate;
 };
 
 /* Set after client placed message with LOG_NONL flag. It indicates the client intention to continue writing
@@ -169,9 +165,9 @@ static int log_nonl;
 static struct log_writer* logwriter;
 
 /* Supported extentions for log rotation */
-static const char* log_exts[] = { ".gz", ".zst", ".log", "" };
+const char *log_exts[] = { ".gz", ".zst", ".log", ".blog", "", NULL };
 
-#ifdef _WINDOWS_
+#ifdef __WINDOWS__
 struct tm *gmtime_r(const time_t *timep, struct tm *result)
 {
 	if (gmtime_s(result, timep))
@@ -196,25 +192,7 @@ static void (*log_handler)(int level, int indent, const char *prefix, const char
 
 static void init_ops_generic(struct log_writer* l);
 
-static char* get_basename_ext(const char* fname, const char** pext);
-
-static inline char* get_basename(const char* fname)
-{
-	return get_basename_ext(fname, 0);
-}
-
-static char * format_filename_ts(const char *basename, const char *ext, const char *low, const char *high)
-{
-	return pcs_xasprintf("%s-%s-%s%s", basename, low, high, ext);
-}
-
-static char * format_filename_active(const char *basename, const char *ext) {
-	return pcs_xasprintf("%s%s", basename, ext);
-}
-
-
-static int file_exists(const char *pathname);
-static int unlink_unused_logs(const char* base_name, int min_part_idx, int max_part_idx);
+static void write_log_header(struct log_writer *l);
 
 #if defined(_ENABLE_GZIP_COMPRESSION) || defined(_ENABLE_ZSTD_COMPRESSION)
 static struct z_funcs_s {
@@ -309,12 +287,16 @@ static int log_file_open(const char *filename, int flag, int pmode)
 static int log_fname_lock(struct log_writer *l)
 {
 	int res;
+
+	if ((l->lflags & PCS_LOG_ROTATE_MASK) != PCS_LOG_ROTATE_ENUM)
+		return 0;
+
 	/* As l->fname is a const field so such lock_fd initialization is ok */
 	/* lock_fd was initialized PCS_INVALID_FD in pcs_set_logfile; First time here, set locked .lck file */
 	if (l->lock_fd != PCS_INVALID_FD)
 		return 0;
 
-	if ((res = pcs_sync_create_lock_file(l->basename, &l->lock_fd)) < 0) {
+	if ((res = pcs_sync_create_lock_file(l->fname, &l->lock_fd)) < 0) {
 		pcs_log(LOG_ERR, "failed to lock log file: %d (%s)", -res, strerror(-res));
 		return -1;
 	}
@@ -452,8 +434,8 @@ int pcs_log_format_time(abs_time_t ts, char* buf, unsigned sz)
 	return __pcs_log_format_time_std(ts, buf, sz, NULL, NULL);
 }
 
-#define COMPACT_TIME_FMT "%Y%m%dT%H%M%S"
-#define COMPACT_TIME_LEN 15
+#define COMPACT_TIME_FMT "%Y%m%dT%H%M"
+#define COMPACT_TIME_LEN 13
 
 int __pcs_log_format_time_compact(abs_time_t ts, char* buf, unsigned sz)
 {
@@ -466,6 +448,17 @@ int __pcs_log_format_time_compact(abs_time_t ts, char* buf, unsigned sz)
 	size_t len = strftime(buf, sz, COMPACT_TIME_FMT, &tm);
 	if (len != COMPACT_TIME_LEN) pcs_abort(); // don't use BUG_ON - recursion
 	return COMPACT_TIME_LEN;
+}
+
+char * format_filename_ts(const char *basename, const char *ext, unsigned long id)
+{
+	abs_time_t ts;
+	char ts_str[COMPACT_TIME_LEN + 1];
+
+	ts = get_real_time_ms();
+	__pcs_log_format_time_compact(ts, ts_str, sizeof(ts_str));
+
+	return pcs_xasprintf("%s-%s.%lu%s", basename, ts_str, id, ext);
 }
 
 /* ----------------------------------------------------------------------------------------------------
@@ -497,7 +490,7 @@ static void __log_vprintf_buf(int level, const char *prefix, const char *fmt, va
 {
 	/* Consider current buffer */
 	struct log_buff *b = &logwriter->b[logwriter->curr];
-	int sz = LOG_BUFF_SZ - b->used - 32 /* max timestamp */ - 64 /* max prefix */ - 48 /* max indent */ - 1 /* \n */;
+	int sz = LOG_BUFF_SZ - b->used - 32 /* max timestamp */ - 1 /* log level */ - 1 /* space */ - 64 /* max prefix */ - 48 /* max indent */ - 1 /* \n */;
 	if (b->full || sz < 0) {
 		/* NOTE: these functions should not use BUG_ON, recursive loop is possible as BUG_ON will call us again. */
 		pcs_abort();
@@ -513,6 +506,13 @@ static void __log_vprintf_buf(int level, const char *prefix, const char *fmt, va
 		ts_len = __pcs_log_format_time_std(t, &b->buff[b->used], 32, last_time_buff, &last_second);
 
 		b->used += ts_len;
+		b->buff[b->used++] = ' ';
+	}
+
+	/* LOG_NOTS actually means that previous print was with LOG_NONL */
+	if (!(level & LOG_NOTS) && logwriter->lflags & PCS_LOG_PRINT_LEVEL) {
+		int name_idx = (level & LOG_LEVEL_MASK) > LOG_LEVEL_MAX ? LOG_LEVEL_MAX : level & LOG_LEVEL_MASK;
+		b->buff[b->used++] = log_level_names[name_idx];
 		b->buff[b->used++] = ' ';
 	}
 
@@ -673,92 +673,18 @@ static int __log_worker_reopen(struct log_writer* l)
 	return 0;
 }
 
-static inline int log_worker_need_rotate(struct log_writer* l)
-{
-	return l->rotate_request || (l->rotate_threshold && l->log_size >= l->rotate_threshold);
-}
-
-static int err_not_exists(int err) {
-#ifdef __WINDOWS__
-	return err == -ERROR_FILE_NOT_FOUND;
-#else  /* __WINDOWS__ */
-	return err == -ENOENT;
-#endif /* __WINDOWS__ */
-}
-
-static int rename_pedantic(const char* src, const char* dst)
-{
-	int res = 0;
-	if (((res = pcs_sync_rename(src, dst)) < 0) && !err_not_exists(res)) {
-		char buf[256];
-		pcs_sys_strerror_r(-res, buf, sizeof(buf));
-		pcs_log(LOG_ERR, "failed to rename log file %s -> %s : %d (%s)", src, dst, -res, buf);
-		return -1;
-	}
-	return 0;
-}
-
-static int rotate_file(const char* base_name, int part_idx, const char* ext)
-{
-	int rc = 0;
-	char* part_name_next = pcs_xasprintf("%s.%d%s", base_name, part_idx + 1, ext);
-	char* part_name;
-	if (part_idx < 0) {
-		part_name = pcs_xasprintf("%s%s", base_name, ext);
-		rc |= rename_pedantic(part_name, part_name_next);
-	} else {
-		part_name = pcs_xasprintf("%s.%d%s", base_name, part_idx, ext);
-		rc |= rename_pedantic(part_name, part_name_next);
-		pcs_free(part_name);
-		pcs_free(part_name_next);
-
-		/* legacy */
-		part_name = pcs_xasprintf("%s%s.%d", base_name, ext, part_idx);
-		part_name_next = pcs_xasprintf("%s%s.%d", base_name, ext, part_idx + 1);
-		rc |= rename_pedantic(part_name, part_name_next);
-	}
-	pcs_free(part_name);
-	pcs_free(part_name_next);
-
-	return rc;
-}
-
-static int unlink_unused_logs(const char* base_name, int min_part_idx, int max_part_idx)
-{
-	int rc = 0;
-	int ext_idx, part_idx;
-	char* part_name;
-
-	if (min_part_idx < 0)
-		min_part_idx = 0;
-	for (part_idx = min_part_idx; part_idx <= max_part_idx; part_idx++)
-		for (ext_idx = 0; ext_idx < sizeof(log_exts) / sizeof(*log_exts); ext_idx++) {
-			part_name = pcs_xasprintf("%s.%d%s", base_name, part_idx, log_exts[ext_idx]);
-			if (file_exists(part_name))
-				rc |= pcs_sync_unlink(part_name);
-			pcs_free(part_name);
-
-			part_name = pcs_xasprintf("%s%s.%d", base_name, log_exts[ext_idx], part_idx);
-			if (file_exists(part_name))
-				rc |= pcs_sync_unlink(part_name);
-			pcs_free(part_name);
-		}
-
-	return rc;
-}
-
-static char* get_basename_ext(const char* fname, const char** pext)
+char* get_basename_ext(const char* fname, const char** pext)
 {
 	char *base_name = pcs_xstrdup(fname);
 	char *ext = strrchr(base_name, '.');
 	if (ext)
 	{
-		int ext_idx;
-		for (ext_idx = 0; ext_idx < sizeof(log_exts) / sizeof(*log_exts); ext_idx++) {
-			if (!strcmp(ext, log_exts[ext_idx])) {
+		int i;
+		for (i = 0; log_exts[i] != NULL; i++) {
+			if (!strcmp(ext, log_exts[i])) {
 				*ext = 0;
 				if (pext) {
-					*pext = log_exts[ext_idx];
+					*pext = log_exts[i];
 				}
 				return base_name;
 			}
@@ -770,79 +696,11 @@ static char* get_basename_ext(const char* fname, const char** pext)
 	return base_name;
 }
 
-static int log_worker_rotate_enum(struct log_writer* l)
+void pcs_apply_log_files_limits(int nfiles, unsigned long long total_size, abs_time_t age_sec)
 {
-	int rc = 0;
-	int ext_idx, part_idx;
-	/*
-	 * We used to supported some other naming approach in the past (.gz.0 e.g.)
-	 * Example (wy whe have to unlink_unused_logs now):
-	 * Let rotation_filenum = 3; i.e. we will have .gz, 0.gz and 1.gz for actual logs;
-	 * Previosly we launched program with rotation_filenum = 2 and old-naming approach; i.e. we already have [.gz, .gz.0]
-	 * 1 rotation: [.gz, gz.0]       --> [.gz, 0.gz, gz.1]           i.e. { .gz -> .0.gz, .gz.0 -> .gz.1 }
-	 * 2 rotation: [.gz, 0.gz, gz.1] --> [.gz, .0.gz, .1.gz, gz.1]   i.e. { .gz -> .0.gz, .0.gz -> .1.gz }
-	 * So, we should remove useles .gz.1 -- (rotation_filenum=3)-2 = 1
-	 */
-	if (unlink_unused_logs(l->basename, l->rotate_filenum - 2, l->rotate_filenum - 1))
-		return rc;
-
-	for (ext_idx = 0; ext_idx < sizeof(log_exts) / sizeof(*log_exts); ext_idx++) {
-		/*
-		 * rotate_file overrites .idx+1* with .idx* file;
-		 * [.gz, 0.gz, 1.gz, .. (rotate_filenum-2).gz] -- totally rotate_filenum files,
-		 * should do renaming from (rotate_filenum-3).gz file downto -1 matches no-indexed .gz file
-		 */
-		for (part_idx = l->rotate_filenum - 3; part_idx >= -1; --part_idx) {
-			if (rotate_file(l->basename, part_idx, log_exts[ext_idx]))
-				return rc;
-		}
-	}
-
-	return rc;
+	struct log_writer *l = logwriter;
+	logrotate_apply_limits(l->rotate.basename, nfiles, total_size, age_sec);
 }
-
-static int log_worker_rotate_ts(struct log_writer* l) {
-	int rc;
-	char *new_name;
-	abs_time_t ts_cur;
-	char ts_cur_str[COMPACT_TIME_LEN + 1];
-	char ts_low_str[COMPACT_TIME_LEN + 1];
-
-	ts_cur = get_real_time_ms();
-	__pcs_log_format_time_compact(ts_cur, ts_cur_str, sizeof(ts_cur_str));
-	__pcs_log_format_time_compact(l->ts_low, ts_low_str, sizeof(ts_low_str));
-
-	new_name = format_filename_ts(l->basename, l->ext, ts_low_str, ts_cur_str);
-	rc = rename_pedantic(l->fname, new_name);
-	pcs_free(new_name);
-
-	l->ts_low = ts_cur;
-
-	pcs_free(l->fname);
-	l->fname = format_filename_active(l->basename, l->ext);
-
-	return rc;
-}
-
-static int log_worker_rotate(struct log_writer* l)
-{
-	int rc;
-
-	switch (l->rotate_mode) {
-	case PCS_LOG_ROTATE_TS:
-		rc = log_worker_rotate_ts(l);
-		break;
-	case PCS_LOG_ROTATE_ENUM:
-		rc = log_worker_rotate_enum(l);
-		break;
-	default:
-		BUG();
-	}
-
-	l->rotate_request = 0; /* cleanup request */
-	return rc;
-}
-
 
 #define LOG_FLUSH_TOUT 5
 
@@ -854,7 +712,7 @@ static pcs_thread_ret_t log_worker(void* arg)
 {
 	int res = 0;
 	struct log_writer* l = arg;
-	pcs_thread_setname(pcs_thread_self(), "logger");
+	pcs_thread_setname("logger");
 	for (;;)
 	{
 		struct timespec ts;
@@ -875,7 +733,7 @@ static pcs_thread_ret_t log_worker(void* arg)
 			/* Check wake up conditions */
 			if (l->b[0].full || l->b[1].full)
 				break;
-			if (l->rotate_request || l->close_request)
+			if (l->rotate.request || l->close_request)
 				break;
 
 			res = pthread_cond_timedwait(&l->cond, &loglock, &ts);
@@ -890,7 +748,7 @@ static pcs_thread_ret_t log_worker(void* arg)
 			/* Enforce current buffer flushing on close or reopen or if the timeout is expired and
 			 * we have the second buffer free (otherwise the client will block).
 			 */
-			if (l->rotate_request || l->close_request || (res == ETIMEDOUT && !l->b[next_buff].full)) {
+			if (l->rotate.request || l->close_request || (res == ETIMEDOUT && !l->b[next_buff].full)) {
 				l->b[l->curr].full = l->b[l->curr].used;
 				l->curr = next_buff;
 				l->b[l->curr].used = 0;
@@ -898,10 +756,9 @@ static pcs_thread_ret_t log_worker(void* arg)
 		}
 		pthread_mutex_unlock(&loglock);
 
-		if (log_worker_need_rotate(l))
-		{
-			if (!log_worker_rotate(l))
-				l->reopen_log(l);
+		if (!logrotate_maybe_run(&l->rotate, l->log_size)) {
+			l->reopen_log(l);
+			write_log_header(l);
 		}
 
 		/* Perform write if necessary */
@@ -1120,6 +977,9 @@ int pcs_log_get_registered_versions(const char *versions[], int sz)
 const char * init_ops(struct log_writer *l, const char *ext) {
 	init_ops_generic(l);
 
+	if (!ext)
+		return "";
+
 #ifdef _ENABLE_GZIP_COMPRESSION
 	if (!strcmp(ext, "gz")) {
 		init_ops_gzip(l);
@@ -1141,12 +1001,12 @@ const char * init_ops(struct log_writer *l, const char *ext) {
 	return ext;
 }
 
-int pcs_set_logfile_ex(const char *prefix, const char *compression,
-			pcs_log_rotate_t rotate_mode)
+int pcs_set_logfile_ex(const char *prefix, const char *compression, int flags)
 {
 	int res = 0;
 	struct log_writer* l;
 	const char *ext;
+	int rotate_mode = flags & PCS_LOG_ROTATE_MASK;
 
 	/* This function may be called only once. It is expected to be called at the application startup so
 	 * no protection from concurrent log access.
@@ -1156,52 +1016,47 @@ int pcs_set_logfile_ex(const char *prefix, const char *compression,
 	/* Only one of two functions: pcs_set_logfile() or pcs_set_log_handler() must be called. */
 	BUG_ON(log_handler);
 
-	if (rotate_mode != PCS_LOG_ROTATE_ENUM && rotate_mode != PCS_LOG_ROTATE_TS)
+	if (rotate_mode != PCS_LOG_ROTATE_ENUM && rotate_mode != PCS_LOG_ROTATE_MULTIPROC)
 		return PCS_ERR_INV_PARAMS;
 
 	/* Allocate context */
 	l = pcs_xzmalloc(sizeof(*l));
 
-	l->rotate_mode = rotate_mode;
-	l->basename = pcs_xstrdup(prefix);
+	l->lflags = flags;
+
+	l->rotate.rflags = rotate_mode;
+	l->rotate.basename = pcs_xstrdup(prefix);
+	l->rotate.fname_p = &l->fname;
+	/* First, init logger to rotate all existent logs on openning (FIXME) */
+	l->rotate.filenum = MAX_LOG_ROTATE_FILENUM;
 
 	ext = init_ops(l, compression);
 
-	/* First, init logger to rotate all existent logs on openning */
-	l->rotate_filenum = MAX_LOG_ROTATE_FILENUM;
 	/* No buffer yet written */
 	l->written = -1;
 	l->lock_fd = PCS_INVALID_FD;
 
-	if (rotate_mode == PCS_LOG_ROTATE_TS) {
-		struct pcs_stat st;
-
-		if (strlen(ext) != 0) {
-			res = snprintf(l->ext, sizeof(l->ext), ".log.%s", ext);
-			BUG_ON(res > sizeof(l->ext) - 1);
-		} else {
-			strncpy(l->ext, ".log", sizeof(l->ext));
-		}
-
-		l->fname = format_filename_active(l->basename, l->ext);
-		res = pcs_sync_stat(l->fname, 0, &st);
 #ifdef __WINDOWS__
-		if (res == -ERROR_FILE_NOT_FOUND)
+	l->rotate.id = GetCurrentProcessId();
 #else
-		if (res == -ENOENT)
-#endif /* __WINDOWS__ */
-			l->ts_low = get_real_time_ms();
-		else
-			l->ts_low = st.ctime_ns / 1000000;
-	} else {
-		BUG_ON(sizeof(l->ext) < strlen(ext) + 1);
-		if (*ext == '\0') {
-			strcpy(l->ext, "log");
+	l->rotate.id = getpid();
+#endif
+
+	if (rotate_mode == PCS_LOG_ROTATE_MULTIPROC) {
+		if (strlen(ext) != 0) {
+			res = snprintf(l->rotate.ext, sizeof(l->rotate.ext), ".log.%s", ext);
+			BUG_ON(res > sizeof(l->rotate.ext) - 1);
 		} else {
-			strncpy(l->ext, ext, sizeof(l->ext) - 1);
-			l->ext[sizeof(l->ext) - 1] = '\0';
+			strncpy(l->rotate.ext, ".log", sizeof(l->rotate.ext));
 		}
-		l->fname = pcs_xasprintf("%s.%s", l->basename, l->ext);
+
+		l->fname = format_filename_ts(prefix, l->rotate.ext, l->rotate.id);
+	} else {
+		BUG_ON(sizeof(l->rotate.ext) < strlen(ext) + 1);
+		strncpy(l->rotate.ext, ext, sizeof(l->rotate.ext) - 1);
+		l->rotate.ext[sizeof(l->rotate.ext) - 1] = '\0';
+
+		l->fname = pcs_xasprintf("%s%s%s", prefix, (l->rotate.ext[0] != '\0') ? "." : "", l->rotate.ext);
 	}
 
 	/* Open log file */
@@ -1212,7 +1067,7 @@ int pcs_set_logfile_ex(const char *prefix, const char *compression,
 	}
 
 	/* Init rotation default; could be changed by user later */
-	l->rotate_filenum = DEF_LOG_ROTATE_FILENUM;
+	l->rotate.filenum = DEF_LOG_ROTATE_FILENUM;
 
 	/* Create condition to wait on */
 	res = pthread_condattr_init(&l->condattr);
@@ -1230,6 +1085,7 @@ int pcs_set_logfile_ex(const char *prefix, const char *compression,
 
 	/* Succeeded */
 	logwriter = l;
+	write_log_header(l);
 	atexit(pcs_log_terminate);
 
 	return 0;
@@ -1308,7 +1164,7 @@ void pcs_log_terminate(void)
 		l = logwriter;
 		logwriter->close_request = 1;
 		pthread_cond_broadcast(&logwriter->cond);
-#ifdef PCS_ADDRESS_SANITIZER
+#ifdef PCS_ADDR_SANIT
 		__lsan_ignore_object(logwriter);
 #endif
 		logwriter = NULL;
@@ -1318,7 +1174,7 @@ void pcs_log_terminate(void)
 	if (l) {
 		pcs_thread_join(l->worker);
 		if (l->lock_fd != PCS_INVALID_FD)
-			pcs_sync_close_lock_file(l->basename, l->lock_fd);
+			pcs_sync_close_lock_file(l->fname, l->lock_fd);
 	}
 	/* Don't free any resources since we are terminating anyway */
 }
@@ -1462,7 +1318,7 @@ void pcs_set_logrotate_size(unsigned long long size)
 	TRACE("%llu", size);
 	if (!log_writer_active())
 		return;
-	logwriter->rotate_threshold = size;
+	logwriter->rotate.threshold = size;
 }
 
 void pcs_set_logrotate_filenum(unsigned int filenum)
@@ -1474,11 +1330,11 @@ void pcs_set_logrotate_filenum(unsigned int filenum)
 		filenum = 2;
 	if (filenum > MAX_LOG_ROTATE_FILENUM)
 		filenum = MAX_LOG_ROTATE_FILENUM;
-	logwriter->rotate_filenum = filenum;
+	logwriter->rotate.filenum = filenum;
 
 	/* Remove greater-numbered logs
 	   Rotation collection looks like [.gz, 0.gz, 1.gz,... {filenum - 2}.gz] -- totally filenum items */
-	unlink_unused_logs(logwriter->basename, filenum - 1, MAX_LOG_ROTATE_FILENUM);
+	logrotate_unlink_unused(logwriter->rotate.basename, filenum - 1, MAX_LOG_ROTATE_FILENUM);
 }
 
 void pcs_ext_logrotate_force(void)
@@ -1487,9 +1343,25 @@ void pcs_ext_logrotate_force(void)
 	 * but the problem is with the internal locking in localtime() */
 	if (!log_writer_active())
 		return;
-	logwriter->rotate_request = 1;
+
+	logwriter->rotate.request = 1;
 	pthread_cond_broadcast(&logwriter->cond);
 }
+
+PCS_API void pcs_set_logrotate_limits(unsigned long long rotate_size, int nfiles, unsigned long long total_size, abs_time_t age_sec)
+{
+	TRACE("nfiles=%d, rotate_size=%llu, total_size=%llu, max_age=%llu", nfiles, rotate_size, total_size, age_sec);
+	if (!log_writer_active())
+		return;
+
+	logwriter->rotate.max_nfiles = nfiles;
+	logwriter->rotate.max_total_size = total_size;
+	logwriter->rotate.max_age_sec = age_sec;
+	logwriter->rotate.threshold = rotate_size;
+
+	pcs_apply_log_files_limits(nfiles, total_size, age_sec);
+}
+
 
 /* Signal handler for external rotation requests.
  * Unlike built in log rotation routine the external one works by means of renaming log files already open
@@ -1717,40 +1589,6 @@ done:
 	return 0;
 }
 
-static int file_exists(const char *pathname)
-{
-#ifdef __WINDOWS__
-	WCHAR * w_pathname = pcs_utf8_to_utf16(pathname, -1);
-	if (!w_pathname)
-		return -(int)GetLastError();
-	DWORD dwAttrib = GetFileAttributesW(w_pathname);
-	pcs_free(w_pathname);
-	return (dwAttrib != INVALID_FILE_ATTRIBUTES &&
-		 !(dwAttrib & FILE_ATTRIBUTE_DIRECTORY));
-#else /* __WINDOWS__ */
-	return (access(pathname, 0) == 0) ? 1 : 0;
-#endif /* __WINDOWS__ */
-}
-
-static int alternative_logs_present(const char *fname)
-{
-	int res = 0;
-
-	char *base_name = get_basename(fname);
-
-	int ext_idx;
-	for (ext_idx = 0; ext_idx < sizeof(log_exts) / sizeof(*log_exts); ext_idx++) {
-		char* alternative_name = pcs_xasprintf("%s%s", base_name, log_exts[ext_idx]);
-		res = file_exists(alternative_name);
-		pcs_free(alternative_name);
-		if (res)
-			break;
-	}
-
-	pcs_free(base_name);
-	return res;
-}
-
 static int z_open_log(struct log_writer *l)
 {
 	int fd = 0;
@@ -1763,7 +1601,7 @@ static int z_open_log(struct log_writer *l)
 	fd = log_file_open(l->fname, O_RDWR, 0);
 	if (fd < 0) {
 		if (errno == ENOENT) {
-			if (alternative_logs_present(l->fname) && log_worker_rotate(l))
+			if (logrotate_run_alt(&l->rotate, l->fname) < 0)
 					return -1;
 			fd = log_file_open(l->fname, O_RDWR | O_CREAT, 0666);
 		}
@@ -2088,7 +1926,7 @@ rotate:
 	pcs_free(buf);
 	log_file_close(fd);
 
-	if (log_worker_rotate(log))
+	if (logrotate_run(&log->rotate))
 		return -1;
 	log->reopen_log(log);
 
@@ -2389,7 +2227,7 @@ rotate:
 	pcs_free(buf);
 
 	log_file_close(fd);
-	if (log_worker_rotate(log)) {
+	if (logrotate_run(&log->rotate)) {
 		return -1;
 	}
 	log->reopen_log(log);
@@ -2471,4 +2309,42 @@ void pcs_err(const char *msg, const char *file, int line, const char *func)
 		pcs_log(LOG_ERR | LOG_NOIND, " %s", version_list[i]);
 	show_trace();
 	pcs_abort();
+}
+
+static void write_log_header(struct log_writer *l) {
+	struct log_buff *b = pcs_xzmalloc(sizeof(*b));
+	const time_t now = time(0);
+	char tz[6];
+#ifndef __WINDOWS__
+	struct tm tm, *tm_ret;
+	int res;
+
+	tm_ret = localtime_r(&now, &tm);
+	BUG_ON(!tm_ret);
+	res = strftime(tz, sizeof(tz), "%z", &tm);
+	BUG_ON(!res);
+#else
+	// On Windows %z can return empty string, see
+	// https://docs.microsoft.com/en-us/cpp/c-runtime-library/reference/strftime-wcsftime-strftime-l-wcsftime-l
+	struct tm local, utc;
+	localtime_s(&local, &now);
+	gmtime_s(&utc, &now);
+
+	// Following code will find difference between local and UTC hours as
+	// numbers, so they must be in the same daylight saving mode
+	utc.tm_isdst = local.tm_isdst;
+
+	const time_t d = (mktime(&local) - mktime(&utc)) / 60; // time difference in minutes
+	const time_t m = llabs(d) % 60;
+	const time_t h = d / 60;
+	snprintf(tz, sizeof(tz), "%+03d%02d", (int)h, (int)m);
+#endif
+
+	b->used = snprintf(b->buff, LOG_BUFF_SZ, "# Log session started. TZ=%s. Version=%s\n", tz, VER_BUILD VER_DEBUG);
+	b->full = b->used;
+
+	pthread_mutex_lock(&flushlock);
+	l->write_buff(l, b);
+	pthread_mutex_unlock(&flushlock);
+	pcs_free(b);
 }

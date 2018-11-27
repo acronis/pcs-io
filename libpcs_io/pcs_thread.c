@@ -13,6 +13,12 @@
 #ifndef __WINDOWS__
 #include <sys/time.h>
 #include <errno.h>
+#include <unistd.h>
+#else
+#include "pcs_winapi.h"
+#endif
+#ifdef __LINUX__
+#include <sys/syscall.h>
 #endif
 
 int pcs_thread_create(pcs_thread_t * thread, const pcs_thread_attr_t * attr, pcs_thread_ret_t (*start_routine)(void *), void * arg)
@@ -104,16 +110,37 @@ int pcs_thread_cond_timedwait(pthread_cond_t * cond, pthread_mutex_t * mutex, un
 	return pthread_cond_timedwait(cond, mutex, &ts);
 }
 
-void pcs_thread_setname(pcs_thread_t thread, const char *name)
+void pcs_thread_setname(const char *name)
 {
 #if defined(__LINUX__)
   #if __GLIBC_PREREQ(2, 12)
-	pthread_setname_np(thread, name);
+	pthread_setname_np(pthread_self(), name);
   #endif
 #elif defined(__MAC__)
 	pthread_setname_np(name);
+#elif defined(__WINDOWS__)
+	if (SetThreadDescriptionPtr) {
+		WCHAR *w_name = pcs_utf8_to_utf16(name, -1);
+		if (w_name) {
+			SetThreadDescriptionPtr(GetCurrentThread(), w_name);
+			pcs_free(w_name);
+		}
+	}
+#endif
+}
+
+unsigned long pcs_thread_id(void)
+{
+#if defined(__LINUX__)
+	return syscall(SYS_gettid);
+#elif defined(__MAC__)
+	uint64_t tid = 0;
+	pthread_threadid_np(NULL, &tid);
+	return tid;
+#elif defined(__WINDOWS__)
+	return GetCurrentThreadId();
 #else
-	/* no support from platform */
+	return (unsigned long)pthread_self();
 #endif
 }
 

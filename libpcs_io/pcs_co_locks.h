@@ -120,6 +120,7 @@ static inline void pcs_co_mutex_init(struct pcs_co_mutex *mutex)
 PCS_API void pcs_co_mutex_lock(struct pcs_co_mutex *mutex);
 PCS_API void pcs_co_mutex_unlock(struct pcs_co_mutex *mutex);
 PCS_API int pcs_co_mutex_trylock(struct pcs_co_mutex *mutex);
+PCS_API int pcs_co_mutex_lock_cancelable(struct pcs_co_mutex *mutex);
 
 static inline int pcs_co_mutex_is_locked(struct pcs_co_mutex *mutex)
 {
@@ -165,7 +166,7 @@ struct pcs_co_rwlock
  *
  * Allowed transitions:
  *   A->B, A->C, B->A, C->A, C->C: lock-free
- *   B->D, C->E, D->B, D->C, D->D, E->B, E->D: under static mutex
+ *   B->D, C->E, D->B, D->C, D->D, E->B, E->C, E->D: under static mutex
  *   E->E: lock-free if number of read locks is decremented, under static mutex otherwise
  */
 
@@ -180,6 +181,10 @@ PCS_API void pcs_co_read_lock(struct pcs_co_rwlock *lock);
 PCS_API void pcs_co_write_lock(struct pcs_co_rwlock *lock);
 PCS_API void pcs_co_read_unlock(struct pcs_co_rwlock *lock);
 PCS_API void pcs_co_write_unlock(struct pcs_co_rwlock *lock);
+PCS_API int pcs_co_read_trylock(struct pcs_co_rwlock *lock);
+PCS_API int pcs_co_write_trylock(struct pcs_co_rwlock *lock);
+PCS_API int pcs_co_read_lock_cancelable(struct pcs_co_rwlock *lock);
+PCS_API int pcs_co_write_lock_cancelable(struct pcs_co_rwlock *lock);
 
 static inline int pcs_co_is_write_locked(struct pcs_co_rwlock *lock)
 {

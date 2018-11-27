@@ -11,7 +11,8 @@
 #include "pcs_ucontext.h"
 #include "std_list.h"
 
-#ifdef PCS_ADDRESS_SANITIZER
+#if defined(__clang__) || defined(PCS_ADDR_SANIT)
+/* clang too aggresivly inlines function which leads to waste of stack space */
 #define PCS_CO_STACK_SIZE	(64*1024)
 #else
 #define PCS_CO_STACK_SIZE	(32*1024)
@@ -78,9 +79,19 @@ struct pcs_coroutine
 	struct pcs_context	*ctx;
 
 	struct pcs_ucontext	context;
-	const void 		*stack_bottom;
-	size_t			stack_size;
-	unsigned int		valgrind_stack_id;
+	union {
+		struct {
+			const void	*stack_bottom;
+			size_t		stack_size;
+		} asan;
+		struct {
+			void		*state;
+			int		keep_state;
+		} tsan;
+		struct {
+			unsigned int	stack_id;
+		} valgrind;
+	};
 
 	int			result;
 	struct pcs_co_waitqueue	join_wq;
@@ -130,7 +141,7 @@ PCS_API int pcs_co_filejob_hash(struct pcs_file_job_conn * io, int (*func)(void 
  * We provide macro to auto select either pcs_co_set_name or much faster variant pcs_co_set_name_fixed,
  * depending on number of arguments passed to pcs_co_set_name */
 PCS_API void pcs_co_set_name(struct pcs_coroutine * co, const char *fmt, ...) __printf(2, 3);
-static inline void pcs_co_set_name_fixed(struct pcs_coroutine * co, const char *name) { co->name = name; }
+PCS_API void pcs_co_set_name_fixed(struct pcs_coroutine * co, const char *name);
 
 #define __pcs_co_set_name_verbatim(x) x
 #define __pcs_co_set_name_select(_10, _9, _8, _7, _6, _5, _4, _3, _2, _1, _, ...) pcs_co_set_name ## _

@@ -116,10 +116,6 @@ static inline int pcs_co_ctx_is_canceled(void)
 	return pcs_context_is_canceled(pcs_current_ctx);
 }
 
-/* ------------------------------------------------------------------------------------------------- */
-/* Internal */
-/* ------------------------------------------------------------------------------------------------- */
-
-int pcs_cancelable_prepare_wait(struct pcs_cancelable *cancelable, struct pcs_context *ctx);
+PCS_API int pcs_cancelable_prepare_wait(struct pcs_cancelable *cancelable, struct pcs_context *ctx);
 
 #endif /* __PCS_CONTEXT_H__ */

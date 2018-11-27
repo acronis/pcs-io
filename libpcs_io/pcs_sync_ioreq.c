@@ -106,7 +106,7 @@ static pcs_thread_ret_t io_process(void * arg)
 {
 	struct pcs_sync_io * io = (struct pcs_sync_io *)arg;
 
-	pcs_thread_setname(pcs_thread_self(), "syncio-io");
+	pcs_thread_setname("syncio-io");
 
 	pthread_mutex_lock(&io->in_mutex);
 	while (!io->shutdown) {
@@ -221,7 +221,7 @@ static pcs_thread_ret_t fsync_process(void * arg)
 {
 	struct pcs_sync_io * io = (struct pcs_sync_io *)arg;
 
-	pcs_thread_setname(pcs_thread_self(), "syncio-fsync");
+	pcs_thread_setname("syncio-fsync");
 
 	pthread_mutex_lock(&io->fsync_mutex);
 	while (!io->shutdown) {

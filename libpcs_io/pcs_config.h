@@ -71,11 +71,31 @@
 #endif
 
 #ifdef __clang__
-#if __clang_major__ >= 4 && __has_feature(address_sanitizer)
-#define PCS_ADDRESS_SANITIZER
+#if __clang_major__ >= 4
+#if __has_feature(address_sanitizer)
+#define PCS_ADDR_SANIT
 #endif
-#elif GCC_VERSION >= 70100 && defined(__SANITIZE_ADDRESS__)
-#define PCS_ADDRESS_SANITIZER
+#if __has_feature(thread_sanitizer)
+#define PCS_THREAD_SANIT
+#define __no_sanitize_thread	__attribute__((no_sanitize_thread))
+#endif
+#endif
+#elif GCC_VERSION >= 70100
+#if defined(__SANITIZE_ADDRESS__)
+#define PCS_ADDR_SANIT
+#endif
+#if defined(__SANITIZE_THREAD__)
+#define PCS_THREAD_SANIT
+#define __no_sanitize_thread	__attribute__((no_sanitize_thread, noipa))
+#endif
+#endif
+#ifdef PCS_THREAD_SANIT
+void __tsan_acquire(void *);
+void __tsan_release(void *);
+#else
+#define __no_sanitize_thread
+#define __tsan_acquire(addr)
+#define __tsan_release(addr)
 #endif
 
 #endif /* __PCSIO_CONFIG_H__ */

@@ -50,7 +50,7 @@ typedef int8_t s8;
 #define llu long long unsigned int
 
 /* ----- helpers ----- */
-
+/* NOTE: use '__restrict' instead of C99 'restrict' as it is supported by all of: gcc, clang, msvc */
 #if defined(__GNUC__) || defined(__clang__)
 
 #define __printf(x,y)		__attribute__((format(printf, x, y)))
@@ -82,7 +82,6 @@ typedef int8_t s8;
 /* MSVC doesn't compile "static inline", but is ok with "static __inline"... */
 #define inline			__inline
 #define __thread		__declspec(thread)
-#define restrict		__restrict
 #define __maybe_unused
 
 #define container_of(ptr, type, member) ((type*)((char*)(ptr) - offsetof(type, member)))
@@ -97,6 +96,9 @@ typedef void *		timer_t;
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
 #endif
 #include <windows.h>
 

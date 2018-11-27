@@ -226,12 +226,12 @@ static void check_can_skip_notifications(void)
 		return;
 
 	int protos[2] = {IPPROTO_TCP, 0};
-	WSAPROTOCOL_INFO *buf;
+	WSAPROTOCOL_INFOW *buf;
 	DWORD buf_sz = 16384;
 	int n;
 	for (;;) {
 		buf = pcs_xmalloc(buf_sz);
-		n = WSAEnumProtocols(protos, buf, &buf_sz);
+		n = WSAEnumProtocolsW(protos, buf, &buf_sz);
 		if (n != SOCKET_ERROR)
 			break;
 

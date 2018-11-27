@@ -8,6 +8,7 @@
 #include "pcs_ucontext.h"
 #include "log.h"
 #include <stdlib.h>
+#include <stdio.h>
 
 #if !defined(HAVE_LIBUNWIND) && defined(__MAC__)
 /* libunwind is part of system library on macOS */

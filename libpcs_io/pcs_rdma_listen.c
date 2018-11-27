@@ -6,12 +6,12 @@
 #include <errno.h>
 
 #include "pcs_types.h"
+#include "log.h"
 #include "pcs_rdma_listen.h"
 #include "pcs_rdma_io.h"
 #include "pcs_rdma_int.h"
 #include "pcs_poll.h"
 #include "pcs_malloc.h"
-#include "log.h"
 
 static struct pcs_netlisten_tops netlisten_tops;
 

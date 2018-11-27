@@ -5,13 +5,13 @@
 #include <string.h>
 #include <errno.h>
 
+#include "log.h"
 #include "pcs_types.h"
 #include "pcs_rdma_conn.h"
 #include "pcs_rdma_io.h"
 #include "pcs_rdma_int.h"
 #include "pcs_poll.h"
 #include "pcs_malloc.h"
-#include "log.h"
 
 #define RESOLVE_TIMEOUT_MS 5000
 

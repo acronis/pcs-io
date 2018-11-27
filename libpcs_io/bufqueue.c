@@ -8,6 +8,9 @@
 #include "log.h"
 
 #include <stdio.h>
+#ifndef __WINDOWS__
+#include <sys/uio.h>
+#endif
 
 struct buffer
 {
@@ -45,9 +48,9 @@ static void notify_data_ready(struct bufqueue *bq)
 		bq->data_ready(bq);
 }
 
-struct bufqueue_shbuf* __bufqueue_shbuf_alloc(struct malloc_item *mi, const char *file, int check, void *buf, u32 size)
+struct bufqueue_shbuf* __bufqueue_shbuf_alloc(struct malloc_item **p_mi, const char *file, int check, void *buf, u32 size)
 {
-	struct bufqueue_shbuf *shbuf = __pcs_malloc(mi, file, 1, sizeof(*shbuf));
+	struct bufqueue_shbuf *shbuf = __pcs_malloc(p_mi, file, 1, sizeof(*shbuf));
 	shbuf->buf = buf;
 	shbuf->size = size;
 	shbuf->refcnt = 1;
@@ -90,12 +93,12 @@ static void free_buffer(struct buffer *b)
 	pcs_free(b);
 }
 
-static struct buffer* alloc_buffer(struct malloc_item *mi, const char *file, struct bufqueue *bq, u32 size)
+static struct buffer* alloc_buffer(struct malloc_item **p_mi, const char *file, struct bufqueue *bq, u32 size)
 {
 	BUG_ON(size == 0);
 
 	u32 full_size = (size > bq->prealloc_size) ? size : bq->prealloc_size;
-	struct buffer *b = __pcs_malloc(mi, file, 1, sizeof(*b) + full_size);
+	struct buffer *b = __pcs_malloc(p_mi, file, 1, sizeof(*b) + full_size);
 	b->buf = b;
 	b->shbuf = NULL;
 	b->head = b->inline_buffer;
@@ -106,9 +109,9 @@ static struct buffer* alloc_buffer(struct malloc_item *mi, const char *file, str
 	return b;
 }
 
-static void build_buffer(struct malloc_item *mi, const char *file, struct bufqueue *bq, const void *data, u32 size)
+static void build_buffer(struct malloc_item **p_mi, const char *file, struct bufqueue *bq, const void *data, u32 size)
 {
-	struct buffer *b = alloc_buffer(mi, file, bq, size);
+	struct buffer *b = alloc_buffer(p_mi, file, bq, size);
 	memcpy(b->inline_buffer, data, size);
 	b->size = size;
 	b->avail -= size;
@@ -123,7 +126,7 @@ void bufqueue_init(struct bufqueue *bq)
 	bq->data_ready_threshold = 1;
 }
 
-void __bufqueue_put(struct malloc_item *mi, const char *file, int check, struct bufqueue *bq, void *data, u32 size)
+void __bufqueue_put(struct malloc_item **p_mi, const char *file, int check, struct bufqueue *bq, void *data, u32 size)
 {
 	BUG_ON(bq->is_shutdown);
 	BUG_ON(size > INT32_MAX - bq->total_size);
@@ -133,7 +136,7 @@ void __bufqueue_put(struct malloc_item *mi, const char *file, int check, struct 
 		return;
 	}
 
-	struct buffer *b = __pcs_malloc(mi, file, 1, sizeof(*b));
+	struct buffer *b = __pcs_malloc(p_mi, file, 1, sizeof(*b));
 	b->buf = data;
 	b->shbuf = NULL;
 	b->head = data;
@@ -146,7 +149,7 @@ void __bufqueue_put(struct malloc_item *mi, const char *file, int check, struct 
 	notify_data_ready(bq);
 }
 
-void __bufqueue_put_copy(struct malloc_item *mi, const char *file, int check, struct bufqueue *bq, const void *data, u32 size)
+void __bufqueue_put_copy(struct malloc_item **p_mi, const char *file, int check, struct bufqueue *bq, const void *data, u32 size)
 {
 	BUG_ON(bq->is_shutdown);
 	BUG_ON(size > INT32_MAX - bq->total_size);
@@ -170,14 +173,14 @@ void __bufqueue_put_copy(struct malloc_item *mi, const char *file, int check, st
 	}
 
 	if (size) {
-		build_buffer(mi, file, bq, data, size);
+		build_buffer(p_mi, file, bq, data, size);
 		bq->total_size += size;
 	}
 
 	notify_data_ready(bq);
 }
 
-void __bufqueue_put_reference(struct malloc_item *mi, const char *file, int check, struct bufqueue *bq, const void *data, u32 size)
+void __bufqueue_put_reference(struct malloc_item **p_mi, const char *file, int check, struct bufqueue *bq, const void *data, u32 size)
 {
 	BUG_ON(bq->is_shutdown);
 	BUG_ON(size > INT32_MAX - bq->total_size);
@@ -185,7 +188,7 @@ void __bufqueue_put_reference(struct malloc_item *mi, const char *file, int chec
 	if (!size)
 		return;
 
-	struct buffer *b = __pcs_malloc(mi, file, 1, sizeof(*b));
+	struct buffer *b = __pcs_malloc(p_mi, file, 1, sizeof(*b));
 	b->buf = NULL;
 	b->shbuf = NULL;
 	b->head = (u8 *)data;
@@ -198,7 +201,7 @@ void __bufqueue_put_reference(struct malloc_item *mi, const char *file, int chec
 	notify_data_ready(bq);
 }
 
-void __bufqueue_copy_referenced(struct malloc_item *mi, const char *file, int check, struct bufqueue *bq)
+void __bufqueue_copy_referenced(struct malloc_item **p_mi, const char *file, int check, struct bufqueue *bq)
 {
 	struct buffer *b, *tmp;
 	cd_list_for_each_entry_safe(struct buffer, b, tmp, &bq->buffers, node) {
@@ -222,7 +225,7 @@ void __bufqueue_copy_referenced(struct malloc_item *mi, const char *file, int ch
 			}
 		}
 
-		void *copy = __pcs_malloc(mi, file, 1, b->size);
+		void *copy = __pcs_malloc(p_mi, file, 1, b->size);
 		memcpy(copy, b->head, b->size);
 		b->buf = copy;
 		b->head = copy;
@@ -230,7 +233,7 @@ void __bufqueue_copy_referenced(struct malloc_item *mi, const char *file, int ch
 	}
 }
 
-void __bufqueue_put_shbuf(struct malloc_item *mi, const char *file, int check, struct bufqueue *bq, struct bufqueue_shbuf *shbuf, const void *data, u32 size)
+void __bufqueue_put_shbuf(struct malloc_item **p_mi, const char *file, int check, struct bufqueue *bq, struct bufqueue_shbuf *shbuf, const void *data, u32 size)
 {
 	BUG_ON(bq->is_shutdown);
 	BUG_ON(size > INT32_MAX - bq->total_size);
@@ -239,7 +242,7 @@ void __bufqueue_put_shbuf(struct malloc_item *mi, const char *file, int check, s
 		return;
 
 	BUG_ON((ULONG_PTR)data < (ULONG_PTR)shbuf->buf || (ULONG_PTR)shbuf->buf + shbuf->size < (ULONG_PTR)data + size);
-	struct buffer *b = __pcs_malloc(mi, file, 1, sizeof(*b));
+	struct buffer *b = __pcs_malloc(p_mi, file, 1, sizeof(*b));
 	b->buf = NULL;
 	b->shbuf = bufqueue_shbuf_get(shbuf);
 	b->head = (u8 *)data;
@@ -273,7 +276,7 @@ void bufqueue_splice_tail(struct bufqueue *src, struct bufqueue *dst)
 		bufqueue_shutdown(dst);
 }
 
-u32 __bufqueue_move(struct malloc_item *mi, const char *file, int check, struct bufqueue *dst, struct bufqueue *src, u32 size)
+u32 __bufqueue_move(struct malloc_item **p_mi, const char *file, int check, struct bufqueue *dst, struct bufqueue *src, u32 size)
 {
 	BUG_ON(dst->is_shutdown);
 	BUG_ON(src->total_size > (u32)(INT32_MAX - dst->total_size));
@@ -288,7 +291,7 @@ u32 __bufqueue_move(struct malloc_item *mi, const char *file, int check, struct 
 			BUG_ON(cd_list_empty(&src->buffers));
 			struct buffer *b = cd_list_first_entry(&src->buffers, struct buffer, node);
 			if (to_move < b->size) {
-				build_buffer(mi, file, dst, b->head, to_move);
+				build_buffer(p_mi, file, dst, b->head, to_move);
 				b->head += to_move;
 				b->size -= to_move;
 				break;
@@ -313,6 +316,11 @@ u32 bufqueue_get_size(const struct bufqueue *bq)
 }
 
 int bufqueue_empty(const struct bufqueue *bq)
+{
+	return bq->total_size == 0;
+}
+
+__no_sanitize_thread int bufqueue_empty_unsafe(const struct bufqueue *bq)
 {
 	return bq->total_size == 0;
 }
@@ -364,6 +372,35 @@ u32 bufqueue_get_copy(struct bufqueue *bq, void *data, u32 size)
 	}
 
 	u32 res = (u32)(out - (char *)data);
+	bq->total_size -= res;
+	notify_write_space(bq);
+	return res;
+}
+
+u32 bufqueue_get_copy_iovec(struct bufqueue *bq, int iovcnt, struct iovec *iov)
+{
+	u32 res = 0;
+	size_t offs = 0;
+	while (iovcnt > 0 && !cd_list_empty(&bq->buffers)) {
+		struct buffer *b = cd_list_first_entry(&bq->buffers, struct buffer, node);
+		size_t size = iov->iov_len - offs;
+		if (b->size > size) {
+			memcpy((char *)iov->iov_base + offs, b->head, size);
+			b->head += size;
+			b->size -= (u32)size;
+			res += (u32)size;
+			iov++;
+			iovcnt--;
+			offs = 0;
+			continue;
+		}
+
+		memcpy((char *)iov->iov_base + offs, b->head, b->size);
+		offs += b->size;
+		res += b->size;
+		free_buffer(b);
+	}
+
 	bq->total_size -= res;
 	notify_write_space(bq);
 	return res;
@@ -479,15 +516,15 @@ void bufqueue_clear(struct bufqueue *bq)
 	BUG_ON(!cd_list_empty(&bq->buffers));
 }
 
-void __bufqueue_printf(struct malloc_item *mi, const char *file, int check, struct bufqueue *bq, const char *fmt, ...)
+void __bufqueue_printf(struct malloc_item **p_mi, const char *file, int check, struct bufqueue *bq, const char *fmt, ...)
 {
 	va_list va;
 	va_start(va, fmt);
-	__bufqueue_vprintf(mi, file, 1, bq, fmt, va);
+	__bufqueue_vprintf(p_mi, file, 1, bq, fmt, va);
 	va_end(va);
 }
 
-void __bufqueue_vprintf(struct malloc_item *mi, const char *file, int check, struct bufqueue *bq, const char *fmt, va_list va)
+void __bufqueue_vprintf(struct malloc_item **p_mi, const char *file, int check, struct bufqueue *bq, const char *fmt, va_list va)
 {
 	struct buffer *b = NULL;
 	char *s = NULL;
@@ -509,7 +546,7 @@ void __bufqueue_vprintf(struct malloc_item *mi, const char *file, int check, str
 	BUG_ON(r < 0);
 
 	if (r >= len) {
-		b = alloc_buffer(mi, file, bq, r + 1);
+		b = alloc_buffer(p_mi, file, bq, r + 1);
 
 		r0 = vsnprintf((char *)b->head, b->avail, fmt, va);
 		BUG_ON(r0 != r);

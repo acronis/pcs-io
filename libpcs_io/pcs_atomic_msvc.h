@@ -159,6 +159,21 @@ static inline s64 pcs_atomic64_fetch_and_xor(pcs_atomic64_t *obj, s64 val)
 	return _InterlockedXor64(&obj->val, val);
 }
 
+static inline ULONG_PTR pcs_atomic_uptr_fetch_and_and(pcs_atomic_ptr_t *obj, ULONG_PTR val)
+{
+	return _InterlockedAnd64(&obj->val, val);
+}
+
+static inline ULONG_PTR pcs_atomic_uptr_fetch_and_or(pcs_atomic_ptr_t *obj, ULONG_PTR val)
+{
+	return _InterlockedOr64(&obj->val, val);
+}
+
+static inline ULONG_PTR pcs_atomic_uptr_fetch_and_xor(pcs_atomic_ptr_t *obj, ULONG_PTR val)
+{
+	return _InterlockedXor64(&obj->val, val);
+}
+
 static inline ULONG_PTR pcs_atomic_uptr_exchange(pcs_atomic_ptr_t *obj, ULONG_PTR val)
 {
 	return _InterlockedExchange64(&obj->val, val);
@@ -260,6 +275,21 @@ static inline s64 pcs_atomic64_fetch_and_xor(pcs_atomic64_t *obj, s64 val)
 	return old_val;
 }
 
+static inline ULONG_PTR pcs_atomic_uptr_fetch_and_and(pcs_atomic_ptr_t *obj, ULONG_PTR val)
+{
+	return _InterlockedAnd(&obj->val, val);
+}
+
+static inline ULONG_PTR pcs_atomic_uptr_fetch_and_or(pcs_atomic_ptr_t *obj, ULONG_PTR val)
+{
+	return _InterlockedOr(&obj->val, val);
+}
+
+static inline ULONG_PTR pcs_atomic_uptr_fetch_and_xor(pcs_atomic_ptr_t *obj, ULONG_PTR val)
+{
+	return _InterlockedXor(&obj->val, val);
+}
+
 static inline ULONG_PTR pcs_atomic_uptr_exchange(pcs_atomic_ptr_t *obj, ULONG_PTR val)
 {
 	return _InterlockedExchange(&obj->val, val);
@@ -320,6 +350,21 @@ static inline void pcs_atomic_uptr_store(pcs_atomic_ptr_t *obj, ULONG_PTR val)
 static inline ULONG_PTR pcs_atomic_uptr_load(pcs_atomic_ptr_t *obj)
 {
 	return obj->val;
+}
+
+static inline void pcs_atomic_uptr_and(pcs_atomic_ptr_t *obj, ULONG_PTR val)
+{
+	pcs_atomic_uptr_fetch_and_and(obj, val);
+}
+
+static inline void pcs_atomic_uptr_or(pcs_atomic_ptr_t *obj, ULONG_PTR val)
+{
+	pcs_atomic_uptr_fetch_and_or(obj, val);
+}
+
+static inline void pcs_atomic_uptr_xor(pcs_atomic_ptr_t *obj, ULONG_PTR val)
+{
+	pcs_atomic_uptr_fetch_and_xor(obj, val);
 }
 
 static inline void pcs_compiler_mb(void)

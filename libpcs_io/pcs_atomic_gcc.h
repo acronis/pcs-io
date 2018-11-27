@@ -214,6 +214,36 @@ static inline ULONG_PTR pcs_atomic_uptr_load(pcs_atomic_ptr_t *obj)
 	return __atomic_load_n(&obj->val, __ATOMIC_RELAXED);
 }
 
+static inline ULONG_PTR pcs_atomic_uptr_fetch_and_and(pcs_atomic_ptr_t *obj, ULONG_PTR val)
+{
+	return __atomic_fetch_and(&obj->val, val, __ATOMIC_SEQ_CST);
+}
+
+static inline void pcs_atomic_uptr_and(pcs_atomic_ptr_t *obj, ULONG_PTR val)
+{
+	pcs_atomic_uptr_fetch_and_and(obj, val);
+}
+
+static inline ULONG_PTR pcs_atomic_uptr_fetch_and_or(pcs_atomic_ptr_t *obj, ULONG_PTR val)
+{
+	return __atomic_fetch_or(&obj->val, val, __ATOMIC_SEQ_CST);
+}
+
+static inline void pcs_atomic_uptr_or(pcs_atomic_ptr_t *obj, ULONG_PTR val)
+{
+	pcs_atomic_uptr_fetch_and_or(obj, val);
+}
+
+static inline ULONG_PTR pcs_atomic_uptr_fetch_and_xor(pcs_atomic_ptr_t *obj, ULONG_PTR val)
+{
+	return __atomic_fetch_xor(&obj->val, val, __ATOMIC_SEQ_CST);
+}
+
+static inline void pcs_atomic_uptr_xor(pcs_atomic_ptr_t *obj, ULONG_PTR val)
+{
+	pcs_atomic_uptr_fetch_and_xor(obj, val);
+}
+
 static inline ULONG_PTR pcs_atomic_uptr_exchange(pcs_atomic_ptr_t *obj, ULONG_PTR val)
 {
 	return __atomic_exchange_n(&obj->val, val, __ATOMIC_SEQ_CST);

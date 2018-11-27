@@ -10,7 +10,7 @@
 #include "bug.h"
 #include "log.h"
 
-void *__pcs_malloc_mmap(struct malloc_item *mi, int bugon_if_failed, size_t size)
+void *__pcs_malloc_mmap(struct malloc_item **p_mi, const char *file, int bugon_if_failed, int flags, size_t size)
 {
 	void *buf = mmap(NULL, sizeof(struct mem_header) + size, PROT_READ|PROT_WRITE,
 			 MAP_ANONYMOUS|MAP_PRIVATE, 0, 0);
@@ -19,9 +19,11 @@ void *__pcs_malloc_mmap(struct malloc_item *mi, int bugon_if_failed, size_t size
 	} else if (buf == MAP_FAILED) {
 		return NULL;
 	}
-	if (mi) {
+
+	struct malloc_item *mi = pcs_malloc_item_init(p_mi, file, flags);
+	if (mi)
 		pcs_account_alloc(mi, size);
-	}
+
 	pcs_fill_mem_header(buf, mi, size);
 	mlock(buf, size + sizeof(struct mem_header));
 	return buf + sizeof(struct mem_header);
@@ -218,8 +220,14 @@ static void mr_pool_free(struct mr_pool *mrp)
 	pcs_free(mrp);
 }
 
-#define pcs_malloc_pool(sz)      TRACE_ALLOC_(__pcs_malloc, 0, PCS_MALLOC_F_POOL, sz)
-#define pcs_malloc_pool_mmap(sz) TRACE_MR_ALLOC_(__pcs_malloc_mmap, 0, PCS_MALLOC_F_POOL, sz)
+static void *__pcs_malloc_with_flags(struct malloc_item **p_mi, const char *file, int bugon_if_failed, int flags, size_t size)
+{
+	pcs_malloc_item_init(p_mi, file, flags);
+	return __pcs_malloc(p_mi, file, bugon_if_failed, size);
+}
+
+#define pcs_malloc_pool(sz)      TRACE_ALLOC(__pcs_malloc_with_flags, 0, PCS_MALLOC_F_POOL, sz)
+#define pcs_malloc_pool_mmap(sz) TRACE_ALLOC(__pcs_malloc_mmap, 0, PCS_MALLOC_F_POOL, sz)
 
 static struct mr_pool *mr_pool_alloc(struct size_desc *sd)
 {
@@ -280,7 +288,7 @@ failed:
 	return NULL;
 }
 
-void *__pcs_mr_malloc(struct malloc_item *tr, int bugon_if_failed, size_t size, int hash_type)
+void *__pcs_mr_malloc(struct malloc_item **p_mi, const char *file, int bugon_if_failed, size_t size, int hash_type)
 {
 	struct size_desc *sd = mr_hash_lookup(size, hash_type);
 	struct mr_pool   *mrp;
@@ -297,7 +305,7 @@ void *__pcs_mr_malloc(struct malloc_item *tr, int bugon_if_failed, size_t size, 
 		mrp = mr_pool_alloc(sd);
 		if (unlikely(!mrp)) {
 			if (bugon_if_failed)
-				pcs_malloc_failed(tr->file);
+				pcs_malloc_failed(file);
 			else
 				return NULL;
 		}
@@ -326,9 +334,11 @@ void *__pcs_mr_malloc(struct malloc_item *tr, int bugon_if_failed, size_t size, 
 	BUG_ON(mrl->mi);
 
 	sd->used_size += size;
-	if (tr) {
-		pcs_account_alloc(tr, size);
-		mrl->mi = tr;
+
+	struct malloc_item *mi = pcs_malloc_item_init(p_mi, file, PCS_MALLOC_F_IN_POOL);
+	if (mi) {
+		pcs_account_alloc(mi, size);
+		mrl->mi = mi;
 	}
 
 	return mrl + 1;

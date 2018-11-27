@@ -7,7 +7,7 @@
 
 #include "pcs_config.h"
 
-#if defined(__linux__) && !defined(PCS_WATCHDOG_DISABLE) && !defined(PCS_ADDRESS_SANITIZER)
+#if defined(__linux__) && !defined(PCS_WATCHDOG_DISABLE) && !defined(PCS_ADDR_SANIT)
 #define PCS_USE_WATCHDOG 1
 #endif
 
@@ -34,7 +34,6 @@ struct pcs_watchdog
 	/* For pcs_evloop */
 	int		wd_poll_count;
 	int		wd_poll_checked;
-	pid_t		wd_pid;
 	abs_time_t	wd_last_activity;
 	abs_time_t	wd_accounted;
 	abs_time_t	wd_inactive_total;

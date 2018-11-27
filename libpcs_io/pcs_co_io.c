@@ -26,12 +26,14 @@
 #include <netinet/in.h>
 #else /* __WINDOWS__ */
 #include <io.h>
+#include <stdio.h>
 #include "pcs_winapi.h"
 #endif
 
-static struct pcs_co_file_ops pcs_co_file_ops;
-static struct pcs_co_file_ops pcs_co_sock_ops;
-static struct pcs_co_file *pcs_co_file_alloc(pcs_fd_t fd, struct pcs_co_file_ops *ops);
+static const struct pcs_co_file_ops pcs_co_file_ops;
+static const struct pcs_co_file_ops pcs_co_sock_ops;
+static const struct pcs_co_file_ops pcs_co_file_with_preadv_ops;
+static struct pcs_co_file *pcs_co_file_alloc(pcs_fd_t fd, const struct pcs_co_file_ops *ops);
 
 /* -------------------------------------------------------------------------------------------------- */
 
@@ -78,7 +80,7 @@ static inline ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off_t
 
 #endif
 
-int pcs_preadv_supported(void)
+static int pcs_preadv_supported(int flag)
 {
 	int ret = syscall(SYS_preadv, -1, NULL, 0, (off_t)0);
 	return !(ret == -1 && errno == ENOSYS);
@@ -86,26 +88,12 @@ int pcs_preadv_supported(void)
 
 struct _co_iov_req_rw
 {
-	struct pcs_file_job fjob;
-
-	void (*cb)(void *arg, int res);
-	void *arg;
-
 	pcs_fd_t fd;
 	u64 offset;
 
 	int iovcnt;
 	const struct iovec *iov;
 };
-
-static void _co_file_job_donev(void *arg)
-{
-	struct _co_iov_req_rw *req = (struct _co_iov_req_rw *)arg;
-
-	req->cb(req->arg, req->fjob.retval);
-
-	pcs_free(req);
-}
 
 static int _co_file_job_readv(void *arg)
 {
@@ -136,23 +124,15 @@ done:
 	return result + rc;
 }
 
-void pcs_co_file_readv_async(struct pcs_co_file *file, const struct iovec *iov, int iovcnt, u64 offset, void (*cb)(void *arg, int res), void *arg)
+static int pcs_co_sync_readv(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u64 offset, u32 flags)
 {
-	struct _co_iov_req_rw *req = pcs_xmalloc(sizeof(*req));
-
-	req->fd = pcs_co_file_fd(file);
-	req->offset = offset;
-	req->cb = cb;
-	req->arg = arg;
-	req->iov = iov;
-	req->iovcnt = iovcnt;
-
-	struct pcs_file_job *fjob = &req->fjob;
-
-	pcs_file_job_init(fjob, _co_file_job_readv, req);
-	pcs_job_init(pcs_current_proc, &fjob->done, _co_file_job_donev, req);
-
-	pcs_file_job_submit(pcs_current_proc->co_io, fjob);
+	struct _co_iov_req_rw req = {
+		.fd = pcs_co_file_fd(file),
+		.iovcnt = iovcnt,
+		.iov = iov,
+		.offset = offset,
+	};
+	return pcs_co_filejob(pcs_current_proc->co_io, _co_file_job_readv, &req);
 }
 
 static int _co_file_job_writev(void *arg)
@@ -184,40 +164,22 @@ done:
 	return result + rc;
 }
 
-void pcs_co_file_writev_async(struct pcs_co_file *file, const struct iovec *iov, int iovcnt, u64 offset, void (*cb)(void *arg, int res), void *arg)
+static int pcs_co_sync_writev(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u64 offset, u32 flags)
 {
-	struct _co_iov_req_rw *req = pcs_xmalloc(sizeof(*req));
-
-	req->fd = pcs_co_file_fd(file);
-	req->offset = offset;
-	req->cb = cb;
-	req->arg = arg;
-	req->iov = iov;
-	req->iovcnt = iovcnt;
-
-	struct pcs_file_job *fjob = &req->fjob;
-
-	pcs_file_job_init(fjob, _co_file_job_writev, req);
-	pcs_job_init(pcs_current_proc, &fjob->done, _co_file_job_donev, req);
-
-	pcs_file_job_submit_hash(pcs_current_proc->co_io, fjob, (unsigned int)req->fd + (unsigned int)(offset / (4*1024*1024)));
+	struct _co_iov_req_rw req = {
+		.fd = pcs_co_file_fd(file),
+		.iovcnt = iovcnt,
+		.iov = iov,
+		.offset = offset,
+	};
+	return pcs_co_filejob(pcs_current_proc->co_io, _co_file_job_writev, &req);
 }
 
 #else /* __LINUX__ */
 
-int pcs_preadv_supported(void)
+static int pcs_preadv_supported(int flag)
 {
 	return 0;
-}
-
-void pcs_co_file_readv_async(struct pcs_co_file *file, const struct iovec *iov, int iovcnt, u64 offset, void (*cb)(void *arg, int res), void *arg)
-{
-	cb(arg, -ENOSYS);
-}
-
-void pcs_co_file_writev_async(struct pcs_co_file *file, const struct iovec *iov, int iovcnt, u64 offset, void (*cb)(void *arg, int res), void *arg)
-{
-	cb(arg, -ENOSYS);
 }
 
 #endif /* __LINUX__ */
@@ -256,7 +218,7 @@ static inline int poll_error_mask(struct pcs_co_file *file)
 #endif
 }
 
-static int pcs_co_nb_read(struct pcs_co_file *file, void * buf, int size, u64 offset, int * timeout_p, u32 flags)
+static int pcs_co_nb_read(struct pcs_co_file *file, void * buf, int size, u64 offset, u32 flags)
 {
 	int err;
 
@@ -301,13 +263,12 @@ static int pcs_co_nb_read(struct pcs_co_file *file, void * buf, int size, u64 of
 		}
 
 		pcs_poll_file_begin(file, POLLIN);
-		if ((err = pcs_co_event_wait_timeout(&file->reader.ev, timeout_p)))
-			return err;
+		pcs_co_event_wait(&file->reader.ev);
 	}
 	return total;
 }
 
-static int pcs_co_nb_write(struct pcs_co_file *file, const void * buf, int size, u64 offset, int * timeout_p, u32 flags)
+static int pcs_co_nb_write(struct pcs_co_file *file, const void * buf, int size, u64 offset, u32 flags)
 {
 	int err;
 
@@ -352,15 +313,149 @@ static int pcs_co_nb_write(struct pcs_co_file *file, const void * buf, int size,
 		}
 
 		pcs_poll_file_begin(file, POLLOUT);
-		if ((err = pcs_co_event_wait_timeout(&file->writer.ev, timeout_p)))
+		pcs_co_event_wait(&file->writer.ev);
+	}
+	return total;
+}
+
+static int pcs_co_nb_readv(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u64 offset, u32 flags)
+{
+	int err;
+
+	if (flags & CO_IO_NOWAIT) {
+		/* Call can be made from any thread, do not use coroutine functions */
+		int n = readv(pcs_co_file_fd(file), iov, iovcnt);
+		if (n >= 0)
+			return n;
+		err = -errno;
+		if (err != -EINTR && err != -EAGAIN)
 			return err;
+		return 0;
+	}
+
+	int total = 0;
+	int skip = 0;
+	for (;;) {
+		if ((err = pcs_cancelable_prepare_wait(&file->reader, pcs_current_co->ctx)))
+			return err;
+
+		int n;
+		if (skip) {
+			struct iovec save_iov = *iov;
+			iov->iov_base += skip;
+			iov->iov_len -= skip;
+			n = readv(pcs_co_file_fd(file), iov, iovcnt);
+			*iov = save_iov;
+		} else {
+			n = readv(pcs_co_file_fd(file), iov, iovcnt);
+		}
+		if (n == 0)
+			break;
+
+		if (n > 0) {
+			total += n;
+			if (flags & CO_IO_PARTIAL)
+				break;
+			n += skip;
+			while (iovcnt && n >= iov->iov_len) {
+				n -= iov->iov_len;
+				iov++;
+				iovcnt--;
+			}
+			if (iovcnt == 0)
+				break;
+
+			skip = n;
+			if (poll_error_mask(file) & (POLLRDHUP|POLLHUP|POLLERR|POLLNVAL))
+				continue;
+		} else {
+			err = -errno;
+			if (err == -EINTR)
+				continue;
+			if (err != -EAGAIN)
+				return err;
+		}
+
+		pcs_poll_file_begin(file, POLLIN);
+		pcs_co_event_wait(&file->reader.ev);
+	}
+	return total;
+}
+
+static int pcs_co_nb_writev(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u64 offset, u32 flags)
+{
+	int err;
+
+	if (flags & CO_IO_NOWAIT) {
+		/* Call can be made from any thread, do not use coroutine functions */
+		int n = writev(pcs_co_file_fd(file), iov, iovcnt);
+		BUG_ON(n == 0);
+		if (n > 0)
+			return n;
+		err = -errno;
+		if (err != -EINTR && err != -EAGAIN)
+			return err;
+		return 0;
+	}
+
+	int total = 0;
+	int skip = 0;
+	for (;;) {
+		if ((err = pcs_cancelable_prepare_wait(&file->writer, pcs_current_co->ctx)))
+			return err;
+
+		int n;
+		if (skip) {
+			struct iovec save_iov = *iov;
+			iov->iov_base += skip;
+			iov->iov_len -= skip;
+			n = writev(pcs_co_file_fd(file), iov, iovcnt);
+			*iov = save_iov;
+		} else {
+			n = writev(pcs_co_file_fd(file), iov, iovcnt);
+		}
+		if (n == 0) {
+			while (iovcnt && !iov->iov_len) {
+				iov++;
+				iovcnt--;
+			}
+			BUG_ON(iovcnt);
+			break;
+		}
+
+		if (n > 0) {
+			total += n;
+			if (flags & CO_IO_PARTIAL)
+				break;
+			n += skip;
+			while (iovcnt && n >= iov->iov_len) {
+				n -= iov->iov_len;
+				iov++;
+				iovcnt--;
+			}
+			if (iovcnt == 0)
+				break;
+
+			skip = n;
+			if (poll_error_mask(file) & (POLLHUP|POLLERR|POLLNVAL))
+				continue;
+		} else {
+			err = -errno;
+			if (err == -EINTR)
+				continue;
+			if (err != -EAGAIN)
+				return err;
+		}
+
+		pcs_poll_file_begin(file, POLLOUT);
+		pcs_co_event_wait(&file->writer.ev);
 	}
 	return total;
 }
 
 /* -------------------------------------------------------------------------------------------------- */
 
-static int pcs_co_connect_sa(struct sockaddr * sa, unsigned int sa_len, struct pcs_co_file ** file_out, int * timeout_p)
+static int pcs_co_connect_sa(struct sockaddr * sa, unsigned int sa_len, struct pcs_co_file ** file_out)
 {
 	int fd, err;
 
@@ -401,8 +496,7 @@ static int pcs_co_connect_sa(struct sockaddr * sa, unsigned int sa_len, struct p
 			break;
 
 		pcs_poll_file_begin(file, POLLOUT);
-		if ((err = pcs_co_event_wait_timeout(&file->writer.ev, timeout_p)))
-			break;
+		pcs_co_event_wait(&file->writer.ev);
 	}
 
 	pcs_co_file_close(file);
@@ -410,7 +504,7 @@ static int pcs_co_connect_sa(struct sockaddr * sa, unsigned int sa_len, struct p
 }
 
 static int pcs_co_accept_sa(struct pcs_co_file * listen, struct sockaddr * sa, unsigned int * sa_len,
-			    struct pcs_co_file ** file_out, int * timeout_p)
+			    struct pcs_co_file ** file_out)
 {
 	int fd;
 
@@ -435,8 +529,7 @@ static int pcs_co_accept_sa(struct pcs_co_file * listen, struct sockaddr * sa, u
 		}
 
 		pcs_poll_file_begin(listen, POLLIN);
-		if ((err = pcs_co_event_wait_timeout(&listen->reader.ev, timeout_p)))
-			return err;
+		pcs_co_event_wait(&listen->reader.ev);
 	}
 
 	pcs_sock_keepalive(fd);
@@ -463,7 +556,7 @@ static int _co_sync_io_read(void * arg)
 	return pcs_sync_nread(req->fd, req->offset, req->buf, req->size);
 }
 
-static int pcs_co_sync_read(struct pcs_co_file *file, void * buf, int size, u64 offset, int * timeout, u32 flags)
+static int pcs_co_sync_read(struct pcs_co_file *file, void * buf, int size, u64 offset, u32 flags)
 {
 	struct _co_io_req_rw req = {
 		.fd = pcs_co_file_fd(file),
@@ -480,7 +573,7 @@ static int _co_sync_io_write(void * arg)
 	return pcs_sync_nwrite(req->fd, req->offset, req->buf, req->size);
 }
 
-static int pcs_co_sync_write(struct pcs_co_file *file, const void * buf, int size, u64 offset, int * timeout, u32 flags)
+static int pcs_co_sync_write(struct pcs_co_file *file, const void * buf, int size, u64 offset, u32 flags)
 {
 	struct _co_io_req_rw req = {
 		.fd = pcs_co_file_fd(file),
@@ -660,11 +753,8 @@ int pcs_co_file_pipe(struct pcs_co_file ** in_file, struct pcs_co_file ** out_fi
 		return -(int)dwError;
 	}
 
-	*in_file = pcs_co_file_alloc_regular(ReadPipeHandle);
-	*out_file = pcs_co_file_alloc_regular(WritePipeHandle);
-	disable_notifications(*in_file, 1);
-	disable_notifications(*out_file, 1);
-
+	*in_file = pcs_co_file_alloc_regular(ReadPipeHandle, O_RDONLY);
+	*out_file = pcs_co_file_alloc_regular(WritePipeHandle, O_WRONLY);
 	return 0;
 }
 
@@ -679,18 +769,16 @@ struct _co_iocp
 
 /* -------------------------------------------------------------------------------------------------- */
 
-static int _co_iocp_wsa_wait(HANDLE handle, struct _co_iocp *co_iocp, int *timeout)
+static int _co_iocp_wsa_wait(HANDLE handle, struct _co_iocp *co_iocp)
 {
-	int rc = pcs_co_event_wait_timeout(co_iocp->co_ev, timeout);
+	pcs_co_event_wait(co_iocp->co_ev);
 	if (pcs_co_event_is_signaled(&co_iocp->op_ev))
 		return pcs_iocp_result(&co_iocp->iocp);
 
 	pcs_iocp_cancel(handle, &co_iocp->iocp);
 	pcs_co_event_wait(&co_iocp->op_ev);
-	if (!rc) {
-		rc = pcs_co_ctx_is_canceled();
-		BUG_ON(!rc);
-	}
+	int rc = pcs_co_ctx_is_canceled();
+	BUG_ON(!rc);
 	return rc;
 }
 
@@ -703,12 +791,11 @@ static void _co_iocp_wsa_done(struct pcs_iocp *iocp)
 	pcs_co_event_signal(co_iocp->co_ev);
 }
 
-static int pcs_co_wsa_recv(struct pcs_co_file *file, char *buf, int size, u64 offset, int *timeout, u32 flags)
+static int pcs_co_wsa_recv_impl(struct pcs_co_file *file, int iovcnt, WSABUF *iov, u32 flags)
 {
 	if (flags & CO_IO_NOWAIT) {
-		WSABUF wsa_buf = {.buf = buf, .len = size};
 		DWORD wsa_flags = 0, rcvd;
-		if (!WSARecv((SOCKET)file->fd, &wsa_buf, 1, &rcvd, &wsa_flags, NULL, NULL))
+		if (!WSARecv((SOCKET)file->fd, iov, iovcnt, &rcvd, &wsa_flags, NULL, NULL))
 			return rcvd;
 		int err = -(int)WSAGetLastError();
 		return err == -WSAEWOULDBLOCK ? 0 : err;
@@ -717,18 +804,17 @@ static int pcs_co_wsa_recv(struct pcs_co_file *file, char *buf, int size, u64 of
 	struct pcs_coroutine *co = pcs_current_co;
 	int total = 0;
 
-	while (size) {
+	for (;;) {
 		int rc;
 		if ((rc = pcs_cancelable_prepare_wait(&co->io_wait, co->ctx)))
 			return rc;
 
 		struct _co_iocp co_iocp = {.iocp = {.done = _co_iocp_wsa_done}, .co_ev = &co->io_wait.ev};
-		WSABUF wsa_buf = {.buf = buf, .len = size};
 		DWORD wsa_flags = 0, rcvd;
-		if (WSARecv((SOCKET)file->fd, &wsa_buf, 1, &rcvd, &wsa_flags, &co_iocp.iocp.overlapped, NULL)) {
+		if (WSARecv((SOCKET)file->fd, iov, iovcnt, &rcvd, &wsa_flags, &co_iocp.iocp.overlapped, NULL)) {
 			rc = -(int)WSAGetLastError();
 			if (rc == -WSA_IO_PENDING)
-				rc = _co_iocp_wsa_wait(file->fd, &co_iocp, timeout);
+				rc = _co_iocp_wsa_wait(file->fd, &co_iocp);
 		} else if (file->skip_sync_notify) {
 			rc = rcvd;
 		} else {
@@ -739,22 +825,29 @@ static int pcs_co_wsa_recv(struct pcs_co_file *file, char *buf, int size, u64 of
 		if (rc <= 0)
 			return total ? total : rc;
 
-		size -= rc;
-		buf += rc;
 		total += rc;
-
 		if (flags & CO_IO_PARTIAL)
 			break;
+
+		while (iovcnt && rc >= iov->len) {
+			rc -= iov->len;
+			iov++;
+			iovcnt--;
+		}
+		if (iovcnt == 0)
+			break;
+
+		iov->len -= rc;
+		iov->buf += rc;
 	}
 	return total;
 }
 
-static int pcs_co_wsa_send(struct pcs_co_file *file, const char *buf, int size, u64 offset, int *timeout, u32 flags)
+static int pcs_co_wsa_send_impl(struct pcs_co_file *file, int iovcnt, WSABUF *iov, u32 flags)
 {
 	if (flags & CO_IO_NOWAIT) {
-		WSABUF wsa_buf = {.buf = (char *)buf, .len = size};
 		DWORD sent;
-		if (!WSASend((SOCKET)file->fd, &wsa_buf, 1, &sent, 0, NULL, NULL))
+		if (!WSASend((SOCKET)file->fd, iov, iovcnt, &sent, 0, NULL, NULL))
 			return sent;
 		int err = -(int)WSAGetLastError();
 		return err == -WSAEWOULDBLOCK ? 0 : err;
@@ -763,18 +856,17 @@ static int pcs_co_wsa_send(struct pcs_co_file *file, const char *buf, int size, 
 	struct pcs_coroutine *co = pcs_current_co;
 	int total = 0;
 
-	while (size) {
+	for (;;) {
 		int rc;
 		if ((rc = pcs_cancelable_prepare_wait(&co->io_wait, co->ctx)))
 			return rc;
 
 		struct _co_iocp co_iocp = {.iocp = {.done = _co_iocp_wsa_done}, .co_ev = &co->io_wait.ev};
-		WSABUF wsa_buf = {.buf = (char *)buf, .len = size};
 		DWORD sent;
-		if (WSASend((SOCKET)file->fd, &wsa_buf, 1, &sent, 0, &co_iocp.iocp.overlapped, NULL)) {
+		if (WSASend((SOCKET)file->fd, iov, iovcnt, &sent, 0, &co_iocp.iocp.overlapped, NULL)) {
 			rc = -(int)WSAGetLastError();
 			if (rc == -WSA_IO_PENDING)
-				rc = _co_iocp_wsa_wait(file->fd, &co_iocp, timeout);
+				rc = _co_iocp_wsa_wait(file->fd, &co_iocp);
 		} else if (file->skip_sync_notify) {
 			rc = sent;
 		} else {
@@ -786,14 +878,74 @@ static int pcs_co_wsa_send(struct pcs_co_file *file, const char *buf, int size, 
 			return rc;
 
 		BUG_ON(!rc);
-		size -= rc;
-		buf += rc;
 		total += rc;
-
 		if (flags & CO_IO_PARTIAL)
 			break;
+
+		while (iovcnt && rc >= iov->len) {
+			rc -= iov->len;
+			iov++;
+			iovcnt--;
+		}
+		if (iovcnt == 0)
+			break;
+
+		iov->len -= rc;
+		iov->buf += rc;
 	}
 	return total;
+}
+
+static int pcs_co_wsa_recv(struct pcs_co_file *file, char *buf, int size, u64 offset, u32 flags)
+{
+	WSABUF wsa_buf = {.buf = buf, .len = size};
+	return pcs_co_wsa_recv_impl(file, 1, &wsa_buf, flags);
+}
+
+static int pcs_co_wsa_send(struct pcs_co_file *file, const char *buf, int size, u64 offset, u32 flags)
+{
+	WSABUF wsa_buf = {.buf = (char *)buf, .len = size};
+	return pcs_co_wsa_send_impl(file, 1, &wsa_buf, flags);
+}
+
+#define WSA_STACK_BUF_SIZE	16
+
+static int pcs_co_wsa_recv_v(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u64 offset, u32 flags)
+{
+	WSABUF stack_buf[WSA_STACK_BUF_SIZE];
+	WSABUF *buf = stack_buf;
+	if (iovcnt > WSA_STACK_BUF_SIZE)
+		buf = pcs_xmalloc(iovcnt * sizeof(*buf));
+
+	int i;
+	for (i = 0; i < iovcnt; i++) {
+		buf[i].buf = iov[i].iov_base;
+		buf[i].len = (ULONG)iov[i].iov_len;
+	}
+	int rc = pcs_co_wsa_recv_impl(file, iovcnt, buf, flags);
+
+	if (buf != stack_buf)
+		pcs_free(buf);
+	return rc;
+}
+
+static int pcs_co_wsa_send_v(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u64 offset, u32 flags)
+{
+	WSABUF stack_buf[WSA_STACK_BUF_SIZE];
+	WSABUF *buf = stack_buf;
+	if (iovcnt > WSA_STACK_BUF_SIZE)
+		buf = pcs_xmalloc(iovcnt * sizeof(*buf));
+
+	int i;
+	for (i = 0; i < iovcnt; i++) {
+		buf[i].buf = iov[i].iov_base;
+		buf[i].len = (ULONG)iov[i].iov_len;
+	}
+	int rc = pcs_co_wsa_send_impl(file, iovcnt, buf, flags);
+
+	if (buf != stack_buf)
+		pcs_free(buf);
+	return rc;
 }
 
 /* -------------------------------------------------------------------------------------------------- */
@@ -805,7 +957,7 @@ static void _co_iocp_file_done(struct pcs_iocp *iocp)
 	pcs_co_event_signal(&co_iocp->op_ev);
 }
 
-static int pcs_co_iocp_read_file(struct pcs_co_file *file, void *buf, int size, u64 offset, int *timeout, u32 flags)
+static int pcs_co_iocp_read_file(struct pcs_co_file *file, void *buf, int size, u64 offset, u32 flags)
 {
 	struct _co_iocp co_iocp = {.iocp = {.overlapped = {.Offset = (DWORD)offset, .OffsetHigh = (DWORD)(offset >> 32)}, .done = _co_iocp_file_done}};
 	int rc;
@@ -826,7 +978,7 @@ static int pcs_co_iocp_read_file(struct pcs_co_file *file, void *buf, int size, 
 	return rc;
 }
 
-static int pcs_co_iocp_write_file(struct pcs_co_file *file, const void * buf, int size, u64 offset, int * timeout, u32 flags)
+static int pcs_co_iocp_write_file(struct pcs_co_file *file, const void * buf, int size, u64 offset, u32 flags)
 {
 	struct _co_iocp co_iocp = {.iocp = {.overlapped = {.Offset = (DWORD)offset, .OffsetHigh = (DWORD)(offset >> 32)}, .done = _co_iocp_file_done}};
 	int rc;
@@ -847,28 +999,19 @@ static int pcs_co_iocp_write_file(struct pcs_co_file *file, const void * buf, in
 
 /* -------------------------------------------------------------------------------------------------- */
 
-int pcs_preadv_supported(void)
+static int pcs_preadv_supported(int flag)
 {
-	return 1;
+	return flag & O_DIRECT;
 }
 
 struct _co_io_req_rwv {
-	struct pcs_iocp		iocp;
-	struct pcs_job		job;
-	void			(*cb)(void *arg, int res);
-	void			*arg;
+	struct _co_iocp		iocp;
+	struct pcs_process	*proc;
 	HANDLE			handle;
 	int			size;
 	int			error;
 	FILE_SEGMENT_ELEMENT	seg[0];
 };
-
-static void _co_io_req_rwv_done(struct pcs_iocp *iocp)
-{
-	struct _co_io_req_rwv *req = container_of(iocp, struct _co_io_req_rwv, iocp);
-
-	pcs_job_wakeup(&req->job);
-}
 
 static int _co_io_req_rwv_alloc(const struct iovec *iov, int iovcnt, struct _co_io_req_rwv **reqp)
 {
@@ -904,7 +1047,8 @@ static int _co_io_req_rwv_alloc(const struct iovec *iov, int iovcnt, struct _co_
 	cur->Buffer = NULL;
 
 	req->size = (int)total;
-	req->iocp.done = _co_io_req_rwv_done;
+	req->iocp.iocp.done = _co_iocp_file_done;
+	req->proc = pcs_current_proc;
 
 	*reqp = req;
 	return 0;
@@ -914,94 +1058,74 @@ static int _co_sync_io_readv(void *arg)
 {
 	struct _co_io_req_rwv *req = arg;
 
-	if (!ReadFileScatter(req->handle, req->seg, req->size, NULL, &req->iocp.overlapped)) {
+	if (!ReadFileScatter(req->handle, req->seg, req->size, NULL, &req->iocp.iocp.overlapped)) {
 		int err = -(int)GetLastError();
 		if (err != -ERROR_IO_PENDING) {
 			req->error = err;
-			pcs_iocp_send(req->job.proc, &req->iocp);
+			pcs_iocp_send(req->proc, &req->iocp.iocp);
 		}
 	}
 	return 0;
 }
 
-static void _co_io_readv_done(void *arg)
+static int pcs_co_iocp_readv_file(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u64 offset, u32 flags)
 {
-	struct _co_io_req_rwv *req = arg;
-
-	int rc = req->error ? req->error : pcs_iocp_result(&req->iocp);
-	if (rc == -ERROR_HANDLE_EOF || rc == -ERROR_BROKEN_PIPE)
-		rc = 0;
-
-	req->cb(req->arg, rc);
-	pcs_free(req);
-}
-
-void pcs_co_file_readv_async(struct pcs_co_file *file, const struct iovec *iov, int iovcnt, u64 offset, void (*cb)(void *arg, int res), void *arg)
-{
-	struct pcs_process *proc = pcs_current_proc;
 	struct _co_io_req_rwv* req;
 	int rc;
 
-	if ((rc = _co_io_req_rwv_alloc(iov, iovcnt, &req))) {
-		cb(arg, rc);
-		return;
-	}
+	if ((rc = _co_io_req_rwv_alloc(iov, iovcnt, &req)))
+		return rc;
 
-	req->iocp.overlapped.Offset = (DWORD)offset;
-	req->iocp.overlapped.OffsetHigh = (DWORD)(offset >> 32);
+	req->iocp.iocp.overlapped.Offset = (DWORD)offset;
+	req->iocp.iocp.overlapped.OffsetHigh = (DWORD)(offset >> 32);
 	req->handle = file->fd;
-	req->cb = cb;
-	req->arg = arg;
-	pcs_job_init(proc, &req->job, _co_io_readv_done, req);
 
 	struct pcs_file_job *job = pcs_file_job_alloc(_co_sync_io_readv, req);
-	pcs_file_job_submit(proc->co_io, job);
+	pcs_file_job_submit(req->proc->co_io, job);
+
+	pcs_co_event_wait(&req->iocp.op_ev);
+	rc = req->error ? req->error : pcs_iocp_result(&req->iocp.iocp);
+	if (rc == -ERROR_HANDLE_EOF || rc == -ERROR_BROKEN_PIPE)
+		rc = 0;
+
+	pcs_free(req);
+	return rc;
 }
 
 static int _co_sync_io_writev(void *arg)
 {
 	struct _co_io_req_rwv *req = arg;
 
-	if (!WriteFileGather(req->handle, req->seg, req->size, NULL, &req->iocp.overlapped)) {
+	if (!WriteFileGather(req->handle, req->seg, req->size, NULL, &req->iocp.iocp.overlapped)) {
 		int err = -(int)GetLastError();
 		if (err != -ERROR_IO_PENDING) {
 			req->error = err;
-			pcs_iocp_send(req->job.proc, &req->iocp);
+			pcs_iocp_send(req->proc, &req->iocp.iocp);
 		}
 	}
 	return 0;
 }
 
-static void _co_io_writev_done(void *arg)
+static int pcs_co_iocp_writev_file(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u64 offset, u32 flags)
 {
-	struct _co_io_req_rwv *req = arg;
-
-	int rc = req->error ? req->error : pcs_iocp_result(&req->iocp);
-
-	req->cb(req->arg, rc);
-	pcs_free(req);
-}
-
-void pcs_co_file_writev_async(struct pcs_co_file *file, const struct iovec *iov, int iovcnt, u64 offset, void (*cb)(void *arg, int res), void *arg)
-{
-	struct pcs_process *proc = pcs_current_proc;
 	struct _co_io_req_rwv* req;
 	int rc;
 
-	if ((rc = _co_io_req_rwv_alloc(iov, iovcnt, &req))) {
-		cb(arg, rc);
-		return;
-	}
+	if ((rc = _co_io_req_rwv_alloc(iov, iovcnt, &req)))
+		return rc;
 
-	req->iocp.overlapped.Offset = (DWORD)offset;
-	req->iocp.overlapped.OffsetHigh = (DWORD)(offset >> 32);
+	req->iocp.iocp.overlapped.Offset = (DWORD)offset;
+	req->iocp.iocp.overlapped.OffsetHigh = (DWORD)(offset >> 32);
 	req->handle = file->fd;
-	req->cb = cb;
-	req->arg = arg;
-	pcs_job_init(proc, &req->job, _co_io_writev_done, req);
 
 	struct pcs_file_job *job = pcs_file_job_alloc(_co_sync_io_writev, req);
-	pcs_file_job_submit(proc->co_io, job);
+	pcs_file_job_submit(req->proc->co_io, job);
+
+	pcs_co_event_wait(&req->iocp.op_ev);
+	rc = req->error ? req->error : pcs_iocp_result(&req->iocp.iocp);
+
+	pcs_free(req);
+	return rc;
 }
 
 /* -------------------------------------------------------------------------------------------------- */
@@ -1011,7 +1135,7 @@ static u8 sock_can_skip_sync_notify(int sa_family)
 	return sa_family == AF_INET ? can_skip_sync_notifications : 0;
 }
 
-static int pcs_co_connect_sa(struct sockaddr * sa, socklen_t sa_len, struct pcs_co_file ** file_out, int * timeout_p)
+static int pcs_co_connect_sa(struct sockaddr * sa, socklen_t sa_len, struct pcs_co_file ** file_out)
 {
 	struct sockaddr_in bind_sa;
 	struct pcs_coroutine *co = pcs_current_co;
@@ -1049,7 +1173,7 @@ static int pcs_co_connect_sa(struct sockaddr * sa, socklen_t sa_len, struct pcs_
 	if (!pcs_connectex(fd, sa, sa_len, NULL, 0, NULL, &co_iocp.iocp.overlapped)) {
 		err = -(int)WSAGetLastError();
 		if (err == -WSA_IO_PENDING)
-			err = _co_iocp_wsa_wait((HANDLE)fd, &co_iocp, timeout_p);
+			err = _co_iocp_wsa_wait((HANDLE)fd, &co_iocp);
 	} else {
 		pcs_co_event_wait(&co_iocp.op_ev);
 		err = pcs_iocp_result(&co_iocp.iocp);
@@ -1074,7 +1198,7 @@ fail:
 }
 
 static int pcs_co_accept_sa(struct pcs_co_file *listen, struct sockaddr * sa, socklen_t * sa_len,
-		  struct pcs_co_file ** file_out, int * timeout_p)
+		  struct pcs_co_file ** file_out)
 {
 	struct
 	{
@@ -1107,7 +1231,7 @@ static int pcs_co_accept_sa(struct pcs_co_file *listen, struct sockaddr * sa, so
 	if (!pcs_acceptex((SOCKET)listen->fd, accepted_sock, &buf[0], 0, sizeof(buf[0]), sizeof(buf[1]), NULL, &co_iocp.iocp.overlapped)) {
 		err = -(int)WSAGetLastError();
 		if (err == -WSA_IO_PENDING)
-			err = _co_iocp_wsa_wait(listen->fd, &co_iocp, timeout_p);
+			err = _co_iocp_wsa_wait(listen->fd, &co_iocp);
 	} else {
 		pcs_co_event_wait(&co_iocp.op_ev);
 		err = pcs_iocp_result(&co_iocp.iocp);
@@ -1173,7 +1297,7 @@ void pcs_co_file_init(struct pcs_co_file *file, struct pcs_co_file_ops *ops)
 	file->fd = PCS_INVALID_FD;
 }
 
-static struct pcs_co_file *pcs_co_file_alloc(pcs_fd_t fd, struct pcs_co_file_ops *ops)
+static struct pcs_co_file *pcs_co_file_alloc(pcs_fd_t fd, const struct pcs_co_file_ops *ops)
 {
 	struct pcs_co_file *file = pcs_xzmalloc(sizeof(*file));
 
@@ -1187,9 +1311,17 @@ static struct pcs_co_file *pcs_co_file_alloc(pcs_fd_t fd, struct pcs_co_file_ops
 	return file;
 }
 
-struct pcs_co_file *pcs_co_file_alloc_regular(pcs_fd_t fd)
+struct pcs_co_file *pcs_co_file_alloc_regular(pcs_fd_t fd, int flag)
 {
-	return pcs_co_file_alloc(fd, &pcs_co_file_ops);
+	int preadv_supported = pcs_preadv_supported(flag);
+	struct pcs_co_file *file = pcs_co_file_alloc(fd, preadv_supported ? &pcs_co_file_with_preadv_ops : &pcs_co_file_ops);
+
+#ifdef __WINDOWS__
+	/* Implementation of pcs_co_iocp_readv_file/pcs_co_iocp_writev_file requires that sync notifications are enabled */
+	disable_notifications(file, !preadv_supported);
+#endif
+
+	return file;
 }
 
 int pcs_co_file_close(struct pcs_co_file *file)
@@ -1203,7 +1335,7 @@ int pcs_co_file_close(struct pcs_co_file *file)
 // ------------------------------------------------------------------------------------------------
 
 /* TODO: kill timeout_p argument also... everything to be done via context... */
-int pcs_co_io_wait_cancellable(int *timeout_p)
+int pcs_co_io_wait_cancelable(int *timeout_p)
 {
 	struct pcs_coroutine *co = pcs_current_co;
 	int err;
@@ -1217,10 +1349,10 @@ int pcs_co_io_wait_cancellable(int *timeout_p)
 	return pcs_context_is_canceled(co->ctx);
 }
 
-int pcs_co_io_wait_cancellable_wq(struct pcs_co_waitqueue *wq, int *timeout)
+int pcs_co_io_wait_cancelable_wq(struct pcs_co_waitqueue *wq, int *timeout)
 {
 	pcs_co_waitqueue_add(wq);
-	int res = pcs_co_io_wait_cancellable(timeout);
+	int res = pcs_co_io_wait_cancelable(timeout);
 	pcs_co_waitqueue_remove();
 	return res;
 }
@@ -1254,12 +1386,7 @@ int pcs_co_file_open(const char * pathname, int flag, int mode, struct pcs_co_fi
 	if (rc)
 		return rc;
 
-	*out_file = pcs_co_file_alloc_regular(fd);
-#ifdef __WINDOWS__
-	/* File opened in O_DIRECT mode can be accessed using pcs_co_file_readv_async/pcs_co_file_writev_async.
-	 * Implementation of these functions requires that sync notifications are enabled */
-	disable_notifications(*out_file, !(flag & O_DIRECT));
-#endif
+	*out_file = pcs_co_file_alloc_regular(fd, flag);
 	return 0;
 }
 
@@ -1292,30 +1419,102 @@ int pcs_co_file_openat(struct pcs_co_file * dir, const char * pathname, int flag
 	if (rc)
 		return rc;
 
-	*out_file = pcs_co_file_alloc_regular(fd);
+	*out_file = pcs_co_file_alloc_regular(fd, flag);
 	return 0;
 }
 
 /* -------------------------------------------------------------------------------------------------- */
 
+static int __pcs_co_file_readv(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u64 offset, u32 flags)
+{
+	if (file->ops->readv != NULL)
+		return file->ops->readv(file, iovcnt, iov, offset, flags);
+
+	u64 nr_bytes_total = 0;
+	const struct iovec *i;
+	for (i = &iov[0]; i != &iov[iovcnt]; ++i) {
+		int r = file->ops->read(file, i->iov_base, (int)i->iov_len, offset, flags);
+		if (r < 0)
+			return r;
+
+		nr_bytes_total += r;
+		offset += r;
+
+		BUG_ON(nr_bytes_total >= (u32)INT32_MAX);
+
+		if (r < (int)i->iov_len)
+			break;
+
+		if (flags & CO_IO_PARTIAL)
+			flags |= CO_IO_NOWAIT; // the following read need not make any progress
+	}
+	return (int)nr_bytes_total;
+}
+
+static int __pcs_co_file_writev(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u64 offset, u32 flags)
+{
+	if (file->ops->writev != NULL)
+		return file->ops->writev(file, iovcnt, iov, offset, flags);
+
+	u64 nr_bytes_total = 0;
+	const struct iovec *i;
+	for (i = &iov[0]; i != &iov[iovcnt]; ++i) {
+		int r = file->ops->write(file, i->iov_base, (int)i->iov_len, offset, flags);
+		if (r < 0)
+			return r;
+
+		nr_bytes_total += r;
+		offset += r;
+
+		BUG_ON(nr_bytes_total >= (u32)INT32_MAX);
+
+		if (r < (int)i->iov_len)
+			break;
+
+		if (flags & CO_IO_PARTIAL)
+			flags |= CO_IO_NOWAIT; // the following write need not make any progress
+	}
+	return (int)nr_bytes_total;
+}
+
 int pcs_co_file_read(struct pcs_co_file *file, void * buf, int size, u64 offset)
 {
-	return file->ops->read(file, buf, size, offset, NULL, 0);
+	return file->ops->read(file, buf, size, offset, 0);
 }
 
 int pcs_co_file_write(struct pcs_co_file *file, const void * buf, int size, u64 offset)
 {
-	return file->ops->write(file, buf, size, offset, NULL, 0);
+	return file->ops->write(file, buf, size, offset, 0);
 }
 
-int pcs_co_file_read_ex(struct pcs_co_file *file, void * buf, int size, u64 offset, int * timeout, u32 flags)
+int pcs_co_file_readv(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u64 offset)
 {
-	return file->ops->read(file, buf, size, offset, timeout, flags);
+	return __pcs_co_file_readv(file, iovcnt, iov, offset, 0);
 }
 
-int pcs_co_file_write_ex(struct pcs_co_file *file, const void * buf, int size, u64 offset, int * timeout, u32 flags)
+int pcs_co_file_writev(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u64 offset)
 {
-	return file->ops->write(file, buf, size, offset, timeout, flags);
+	return __pcs_co_file_writev(file, iovcnt, iov, offset, 0);
+}
+
+int pcs_co_file_read_ex(struct pcs_co_file *file, void * buf, int size, u32 flags)
+{
+	return file->ops->read(file, buf, size, 0, flags);
+}
+
+int pcs_co_file_write_ex(struct pcs_co_file *file, const void * buf, int size, u32 flags)
+{
+	return file->ops->write(file, buf, size, 0, flags);
+}
+
+int pcs_co_file_readv_ex(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u32 flags)
+{
+	return __pcs_co_file_readv(file, iovcnt, iov, 0, flags);
+}
+
+int pcs_co_file_writev_ex(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u32 flags)
+{
+	return __pcs_co_file_writev(file, iovcnt, iov, 0, flags);
 }
 
 /* -------------------------------------------------------------------------------------------------- */
@@ -1705,13 +1904,13 @@ int pcs_co_listen(PCS_NET_ADDR_T * na, int flags, struct pcs_co_file ** listen_o
 	return r;
 }
 
-int pcs_co_accept(struct pcs_co_file *listen, PCS_NET_ADDR_T * na, struct pcs_co_file ** file_out, int * timeout_p)
+int pcs_co_accept(struct pcs_co_file *listen, PCS_NET_ADDR_T * na, struct pcs_co_file ** file_out)
 {
 	struct sockaddr_storage sa;
 	socklen_t sa_len = sizeof(sa);
 	int r;
 
-	if ((r = pcs_co_accept_sa(listen, (struct sockaddr *)&sa, &sa_len, file_out, timeout_p)))
+	if ((r = pcs_co_accept_sa(listen, (struct sockaddr *)&sa, &sa_len, file_out)))
 		return r;
 
 	if ((r = pcs_sockaddr2netaddr(na, (struct sockaddr *)&sa))) {
@@ -1722,7 +1921,7 @@ int pcs_co_accept(struct pcs_co_file *listen, PCS_NET_ADDR_T * na, struct pcs_co
 	return 0;
 }
 
-int pcs_co_connect(PCS_NET_ADDR_T * na, struct pcs_co_file ** file_out, int * timeout)
+int pcs_co_connect(PCS_NET_ADDR_T * na, struct pcs_co_file ** file_out)
 {
 	struct sockaddr *sa = NULL;
 	int sa_len = 0;
@@ -1732,7 +1931,7 @@ int pcs_co_connect(PCS_NET_ADDR_T * na, struct pcs_co_file ** file_out, int * ti
 	if (sa == NULL)
 		return -EAFNOSUPPORT;
 
-	r = pcs_co_connect_sa(sa, sa_len, file_out, timeout);
+	r = pcs_co_connect_sa(sa, sa_len, file_out);
 	pcs_free(sa);
 	return r;
 }
@@ -1741,29 +1940,55 @@ int pcs_co_connect(PCS_NET_ADDR_T * na, struct pcs_co_file ** file_out, int * ti
 
 #ifndef __WINDOWS__
 /* generic syncronous I/O redirected to co_io thread pool */
-static struct pcs_co_file_ops pcs_co_file_ops = {
+static const struct pcs_co_file_ops pcs_co_file_ops = {
 	.read			= pcs_co_sync_read,
 	.write			= pcs_co_sync_write,
+	.readv			= NULL,
+	.writev			= NULL,
 	.close			= pcs_co_sync_close
 };
 
-static struct pcs_co_file_ops pcs_co_sock_ops = {
+#ifdef __LINUX__
+static const struct pcs_co_file_ops pcs_co_file_with_preadv_ops = {
+	.read			= pcs_co_sync_read,
+	.write			= pcs_co_sync_write,
+	.readv			= pcs_co_sync_readv,
+	.writev			= pcs_co_sync_writev,
+	.close			= pcs_co_sync_close
+};
+#endif
+
+static const struct pcs_co_file_ops pcs_co_sock_ops = {
 	.read			= pcs_co_nb_read,
 	.write			= pcs_co_nb_write,
+	.readv			= pcs_co_nb_readv,
+	.writev			= pcs_co_nb_writev,
 	.close			= pcs_co_nb_close
 };
 
 #else /* __WINDOWS__ */
 
-static struct pcs_co_file_ops pcs_co_file_ops = {
+static const struct pcs_co_file_ops pcs_co_file_ops = {
 	.read			= pcs_co_iocp_read_file,
 	.write			= pcs_co_iocp_write_file,
+	.readv			= NULL,
+	.writev			= NULL,
 	.close			= pcs_co_iocp_close_file
 };
 
-static struct pcs_co_file_ops pcs_co_sock_ops = {
+static const struct pcs_co_file_ops pcs_co_file_with_preadv_ops = {
+	.read			= pcs_co_iocp_read_file,
+	.write			= pcs_co_iocp_write_file,
+	.readv			= pcs_co_iocp_readv_file,
+	.writev			= pcs_co_iocp_writev_file,
+	.close			= pcs_co_iocp_close_file
+};
+
+static const struct pcs_co_file_ops pcs_co_sock_ops = {
 	.read			= pcs_co_wsa_recv,
 	.write			= pcs_co_wsa_send,
+	.readv			= pcs_co_wsa_recv_v,
+	.writev			= pcs_co_wsa_send_v,
 	.close			= pcs_co_wsa_close
 };
 

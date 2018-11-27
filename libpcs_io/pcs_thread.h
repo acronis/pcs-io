@@ -23,7 +23,8 @@ int pcs_thread_equal(pcs_thread_t t1, pcs_thread_t t2);
 int pcs_thread_timedjoin(pcs_thread_t thread, void **retval, unsigned int timeout_ms);
 int pcs_thread_cond_timedwait(pthread_cond_t * cond, pthread_mutex_t * mutex, unsigned int timeout_ms);
 void pcs_thread_deadline(struct timespec * ts, unsigned int timeout_ms);
-PCS_API void pcs_thread_setname(pcs_thread_t thread, const char *name);
+PCS_API void pcs_thread_setname(const char *name);
+unsigned long pcs_thread_id(void);
 
 struct pcs_thread_barrier {
 	pthread_mutex_t mutex;

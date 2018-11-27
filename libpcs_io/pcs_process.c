@@ -36,22 +36,26 @@
 
 static inline int pending_jobs(struct pcs_evloop * evloop)
 {
-	return !cd_list_empty(&evloop->jobs);
+	return !cd_list_empty(&evloop->jobs) || pcs_atomic32_load(&evloop->proc->remote_job_present);
 }
 
 static void check_jobs(struct pcs_evloop * evloop)
 {
-	struct cd_list local_q;
+	struct pcs_process *proc = evloop->proc;
+	CD_LIST_HEAD(local_q);
 
-	if (!pending_jobs(evloop))
-		return;
+	cd_list_splice_tail(&evloop->jobs, &local_q);
 
-	cd_list_init(&local_q);
-	cd_list_splice(&evloop->jobs, &local_q);
+	if (pcs_atomic32_load(&proc->remote_job_present)) {
+		pthread_mutex_lock(&proc->remote_job_mutex);
+		cd_list_splice_tail(&proc->remote_job_queue, &local_q);
+		pcs_atomic32_store(&proc->remote_job_present, 0);
+		pthread_mutex_unlock(&proc->remote_job_mutex);
+	}
 
 	while (!cd_list_empty(&local_q)) {
 		struct pcs_job * j = cd_list_first_entry(&local_q, struct pcs_job, list);
-		BUG_ON(j->proc != evloop->proc);
+		BUG_ON(j->proc != proc);
 
 		cd_list_del_init(&j->list);
 		j->work(j->data);
@@ -94,6 +98,7 @@ void pcs_job_wakeup(struct pcs_job * job)
 	pthread_mutex_lock(&proc->remote_job_mutex);
 	int wakeup = cd_list_empty(&proc->remote_job_queue);
 	cd_list_add_tail(&job->list, &proc->remote_job_queue);
+	pcs_atomic32_store(&proc->remote_job_present, 1);
 	pthread_mutex_unlock(&proc->remote_job_mutex);
 	if (wakeup)
 		pcs_event_ioconn_wakeup(proc->remote_job_event);
@@ -176,8 +181,8 @@ static void eventloop_enter(struct pcs_evloop * evloop)
 	pcs_current_evloop = evloop;
 	pcs_current_co = NULL;
 
-	pcs_thread_setname(pcs_thread_self(), evloop->proc->name);
-	evloop->thr = pcs_thread_self();
+	pcs_thread_setname(evloop->proc->name);
+	evloop->thr_id = pcs_thread_id();
 
 	s32 e = pcs_atomic32_fetch_and_add(&evloop->proc->loop_enter, 1);
 	BUG_ON(e > INT32_MAX / 2);
@@ -194,18 +199,13 @@ static void eventloop_leave(struct pcs_evloop * evloop)
 
 static void remote_job_data_ready(void *priv)
 {
-	struct pcs_process *proc = priv;
-
-	pthread_mutex_lock(&proc->remote_job_mutex);
-	cd_list_splice_tail(&proc->remote_job_queue, &pcs_current_evloop->jobs);
-	pthread_mutex_unlock(&proc->remote_job_mutex);
 }
 
 static int pcs_remote_init(struct pcs_process *proc)
 {
 	pthread_mutex_init(&proc->remote_job_mutex, NULL);
 	cd_list_init(&proc->remote_job_queue);
-	return pcs_event_ioconn_init(proc, &proc->remote_job_event, remote_job_data_ready, proc);
+	return pcs_event_ioconn_init(proc, &proc->remote_job_event, remote_job_data_ready, NULL);
 }
 
 static void pcs_remote_fini(struct pcs_process *proc)
@@ -350,6 +350,7 @@ static void send_terminate_job(struct terminate_job *job)
 	pthread_mutex_lock(&proc->remote_job_mutex);
 	int wakeup = cd_list_empty(&proc->remote_job_queue);
 	cd_list_add_tail(&job->job.list, &proc->remote_job_queue);
+	pcs_atomic32_store(&proc->remote_job_present, 1);
 
 	/* Call pcs_event_ioconn_wakeup() under lock in order
 	 * to avoid possible races with pcs_process destruction */

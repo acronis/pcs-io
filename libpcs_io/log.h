@@ -97,23 +97,20 @@ PCS_API int pcs_log_get_registered_versions(const char *versions[], int sz);
 int pcs_log_format_time(abs_time_t ts, char* buff, unsigned sz);
 int __pcs_log_format_time_std(abs_time_t ts, char* buff, unsigned sz, char *saved_time_buff, time_t *current_sec);
 
-typedef enum {
-	/* Rotate scheme based on enumeration. The same as in logrotate. */
-	PCS_LOG_ROTATE_ENUM,
-	/* Naming scheme which includes timestamps. Old log files have names
-	 * <prefix>-<start ts>-<finish ts>.log[.gz|.zst], where start ts and finish ts
-	 * are time range of the log file. Active file name is the same, but finish ts
-	 * is the largest possible timestamp.
-	 *
-	 * NOTE: libpcs doesn't remove old log files in this mode. */
-	PCS_LOG_ROTATE_TS,
-} pcs_log_rotate_t;
+#define PCS_LOG_ROTATE_MASK		0x7
+#define PCS_LOG_PRINT_LEVEL		(1 << 3)
 
 /* Direct log output to the file and switch to buffered asynchronous writing scheme.
  * This function may be called only once. It is expected to be called at the application startup.
- * Only one of two functions: pcs_set_logfile[_ex]() or pcs_set_log_handler() must be called. */
-PCS_API int pcs_set_logfile_ex(const char *prefix, const char *compression,
-				pcs_log_rotate_t rotate_mode);
+ * Only one of two functions: pcs_set_logfile[_ex]() or pcs_set_log_handler() must be called.
+ *
+ * prefix: file name prefix (includes directory). See comments in pcs_log_rotate_t for
+ *   filename formats.
+ * compression: "gz", "zst" or "" (empty string)
+ * rotate_mode: PCS_LOG_ROTATE_ENUM or PCS_LOG_ROTATE_MULTIPROC
+ * id: include this numeric id to filename. If 0 - use PID, if > 0 - use
+ * this id (PCS_LOG_ROTATE_MULTIPROC mode only) */
+PCS_API int pcs_set_logfile_ex(const char *prefix, const char *compression, int flags);
 
 /* pcs_set_logfile_ex with PCS_LOG_TS_STD timestamps format */
 PCS_API int pcs_set_logfile(const char * path);
@@ -125,6 +122,7 @@ const char* pcs_get_logfile(void);
  * The returned basename part must be freed by caller passing them to pcs_free().
  */
 char* pcs_get_logfile_base_ext(const char** pext);
+extern const char *log_exts[];
 
 /* Direct log output to the function handler(level, fmt, va).
  * This function may be called only once. It is expected to be called at the application startup.
@@ -156,14 +154,14 @@ void pcs_syslog(struct pcs_syslog_logger *l, int priority, const char *fmt, ...)
 int pcs_syslog_open(struct pcs_process *proc, const char *name, struct pcs_syslog_logger **logger);
 void pcs_syslog_close(struct pcs_syslog_logger *l);
 
-/*
- * Log rotation support (buffered writing only).
- */
-#define DEF_LOG_ROTATE_FILENUM 5
-#define MAX_LOG_ROTATE_FILENUM 100
-
+/* PCS_LOG_ROTATE_ENUM mode only */
 PCS_API void pcs_set_logrotate_size(unsigned long long size);
 PCS_API void pcs_set_logrotate_filenum(unsigned int filenum);
+
+/* PCS_LOG_ROTATE_MULTIPROC mode only */
+PCS_API void pcs_set_logrotate_limits(unsigned long long rotate_size, int nfiles, unsigned long long total_size, abs_time_t max_age_sec);
+PCS_API void pcs_apply_log_files_limits(int nfiles, unsigned long long total_size, abs_time_t age_sec);
+
 PCS_API void pcs_ext_logrotate_sighandler(int signum);
 void pcs_ext_logrotate_force(void);
 
@@ -184,5 +182,8 @@ void pcs_log_exitmsg(const char *fmt, ...) __printf(1,2);
 
 #define TRACE_ACTIVE_(l) (pcs_log_level >= (l))
 #define TRACE_ACTIVE TRACE_ACTIVE_(LOG_TRACE)
+
+char* get_basename_ext(const char* fname, const char** pext);
+char * format_filename_ts(const char *basename, const char *ext, unsigned long id);
 
 #endif /* __PCSLOG_H__ */

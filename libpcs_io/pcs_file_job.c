@@ -21,11 +21,11 @@ static pcs_thread_ret_t file_job_run(void * arg)
 {
 	struct pcs_file_job_queue * w = arg;
 
-	pcs_thread_setname(pcs_thread_self(), w->conn->name);
+	pcs_thread_setname(w->conn->name);
 
 #ifdef __WINDOWS__
-	if (ConvertThreadToFiberEx(NULL, 0) == NULL) {
-		pcs_log_syserror(LOG_ERR, GetLastError(), "file_job_run: ConvertThreadToFiberEx failed");
+	if (ConvertThreadToFiber(NULL) == NULL) {
+		pcs_log_syserror(LOG_ERR, GetLastError(), "file_job_run: ConvertThreadToFiber failed");
 		BUG();
 	}
 #endif

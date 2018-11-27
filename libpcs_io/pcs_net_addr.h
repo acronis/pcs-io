@@ -60,11 +60,11 @@ PCS_API int pcs_parse_netaddr_port(const char *str, const char *def_port, PCS_NE
 PCS_API int pcs_parse_netaddr_port_multi(const char *str, const char *def_port, int * nr_addrs, PCS_NET_ADDR_T ** addrs);
 
 /* A version of pcs_parse_netaddr() that can be used from a coroutine. */
-PCS_API int pcs_co_parse_netaddr(const char *str, PCS_NET_ADDR_T *addr, int *timeout);
+PCS_API int pcs_co_parse_netaddr(const char *str, PCS_NET_ADDR_T *addr);
 /* A version of pcs_parse_netaddr_port() that can be used from a coroutine. */
-PCS_API int pcs_co_parse_netaddr_port(const char *str, const char *def_port, PCS_NET_ADDR_T *addr, int *timeout);
+PCS_API int pcs_co_parse_netaddr_port(const char *str, const char *def_port, PCS_NET_ADDR_T *addr);
 /* A version of pcs_parse_netaddr_port_multi() that can be used from a coroutine. */
-PCS_API int pcs_co_parse_netaddr_port_multi(const char *str, const char *def_port, int * nr_addrs, PCS_NET_ADDR_T ** addrs, int *timeout);
+PCS_API int pcs_co_parse_netaddr_port_multi(const char *str, const char *def_port, int * nr_addrs, PCS_NET_ADDR_T ** addrs);
 
 /* get human-readable string for error returned by pcs_parse_netaddr */
 PCS_API const char *pcs_parse_netaddr_err(int err_code);

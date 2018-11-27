@@ -131,10 +131,8 @@ static unsigned add_standby_page(struct mem_pool* p, struct pool_page_hdr* pg)
 #endif
 #ifndef __WINDOWS__
 	res = madvise((void *)pg, PAGE_SIZE, MADV_ATTR);
-	BUG_ON(res);
-#else
-	(void)res;
 #endif
+	(void)res;
 
 	return 1;
 }

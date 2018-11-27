@@ -290,7 +290,72 @@ int pcs_co_mutex_trylock(struct pcs_co_mutex *mutex)
 	if (likely(pcs_atomic_uptr_cas(&mutex->val, 0, self) == 0))
 		return 0;
 
-	return -1;
+	return -PCS_CO_WOULDBLOCK;
+}
+
+int pcs_co_mutex_lock_cancelable(struct pcs_co_mutex *mutex)
+{
+	struct pcs_coroutine *co = pcs_current_co;
+	BUG_ON(!co);
+
+	ULONG_PTR self = (ULONG_PTR)co;
+
+	/* Transition A->B */
+	if (likely(pcs_atomic_uptr_cas(&mutex->val, 0, self) == 0))
+		return 0;
+
+	int rc;
+	if ((rc = pcs_cancelable_prepare_wait(&co->io_wait, co->ctx)))
+		return rc;
+
+	pthread_mutex_t *mtx = lock_static_mtx(mutex);
+
+	ULONG_PTR val = pcs_atomic_uptr_load(&mutex->val);
+	for (;;) {
+		if (val == 0) {
+			/* Transition A->B */
+			if ((val = pcs_atomic_uptr_cas(&mutex->val, 0, self)) != 0)
+				continue;
+
+			pthread_mutex_unlock(mtx);
+			return 0;
+		}
+
+		if (val & PCS_CO_MUTEX_HAS_WAITERS)
+			break;
+
+		/* Transition B->C */
+		ULONG_PTR res = pcs_atomic_uptr_cas(&mutex->val, val, val | PCS_CO_MUTEX_HAS_WAITERS);
+		if (res == val)
+			break;
+
+		val = res;
+	}
+
+	BUG_ON((val & ~PCS_CO_MUTEX_HAS_WAITERS) == self);
+
+	struct wait_item w = {.co = co, .event = &co->io_wait.ev, .lock = mutex, .get_holder = __pcs_co_mutex_get_holder};
+	cd_list_add_tail(&w.lst, &mutex->waiters);
+	pthread_mutex_unlock(mtx);
+
+	lock_wait(&w, NULL);
+
+	pthread_mutex_lock(mtx);
+	if (cd_list_empty(&w.lst)) {
+		pthread_mutex_unlock(mtx);
+		return 0;
+	}
+
+	cd_list_del(&w.lst);
+	if (cd_list_empty(&mutex->waiters)) {
+		/* Transition C->B */
+		pcs_atomic_uptr_and(&mutex->val, ~PCS_CO_MUTEX_HAS_WAITERS);
+	}
+
+	pthread_mutex_unlock(mtx);
+	rc = pcs_context_is_canceled(co->ctx);
+	BUG_ON(!rc);
+	return rc;
 }
 
 void pcs_co_mutex_unlock(struct pcs_co_mutex *mutex)
@@ -363,10 +428,10 @@ void pcs_co_read_lock(struct pcs_co_rwlock *lock)
 			return;
 		}
 
-		if (val & 1)
+		if (val & PCS_CO_RWLOCK_HAS_WAITERS)
 			break;
 
-		/* Transition B->D or C->E */
+		/* Transition B->D */
 		ULONG_PTR res = pcs_atomic_uptr_cas(&lock->val, val, val | PCS_CO_RWLOCK_HAS_WAITERS);
 		if (res == val)
 			break;
@@ -427,6 +492,150 @@ void pcs_co_write_lock(struct pcs_co_rwlock *lock)
 
 	lock_wait(&w, NULL);
 	BUG_ON(!cd_list_empty(&w.lst));
+}
+
+int pcs_co_read_trylock(struct pcs_co_rwlock *lock)
+{
+	struct pcs_coroutine *co = pcs_current_co;
+	BUG_ON(!co);
+
+	if (likely(__pcs_co_read_trylock(lock) == 0))
+		return 0;
+
+	return -PCS_CO_WOULDBLOCK;
+}
+
+int pcs_co_write_trylock(struct pcs_co_rwlock *lock)
+{
+	struct pcs_coroutine *co = pcs_current_co;
+	BUG_ON(!co);
+
+	ULONG_PTR self = (ULONG_PTR)co | PCS_CO_RWLOCK_WRITE_LOCKED;
+
+	/* Transition A->B */
+	if (likely(pcs_atomic_uptr_cas(&lock->val, 0, self) == 0))
+		return 0;
+
+	return -PCS_CO_WOULDBLOCK;
+}
+
+int pcs_co_read_lock_cancelable(struct pcs_co_rwlock *lock)
+{
+	struct pcs_coroutine *co = pcs_current_co;
+	BUG_ON(!co);
+
+	if (likely(__pcs_co_read_trylock(lock) == 0))
+		return 0;
+
+	int rc;
+	if ((rc = pcs_cancelable_prepare_wait(&co->io_wait, co->ctx)))
+		return rc;
+
+	pthread_mutex_t *mtx = lock_static_mtx(lock);
+
+	ULONG_PTR val;
+	for (;;) {
+		if ((val = __pcs_co_read_trylock(lock)) == 0) {
+			pthread_mutex_unlock(mtx);
+			return 0;
+		}
+
+		if (val & PCS_CO_RWLOCK_HAS_WAITERS)
+			break;
+
+		/* Transition B->D */
+		ULONG_PTR res = pcs_atomic_uptr_cas(&lock->val, val, val | PCS_CO_RWLOCK_HAS_WAITERS);
+		if (res == val)
+			break;
+	}
+
+	struct wait_item w = {.co = co, .event = &co->io_wait.ev, .lock = lock, .get_holder = __pcs_co_rwlock_get_holder};
+	cd_list_add_tail(&w.lst, &lock->rwaiters);
+	pthread_mutex_unlock(mtx);
+
+	lock_wait(&w, NULL);
+
+	pthread_mutex_lock(mtx);
+	if (cd_list_empty(&w.lst)) {
+		pthread_mutex_unlock(mtx);
+		return 0;
+	}
+
+	cd_list_del(&w.lst);
+	if (cd_list_empty(&lock->wwaiters) && cd_list_empty(&lock->rwaiters)) {
+		/* Transition D->B */
+		pcs_atomic_uptr_and(&lock->val, ~PCS_CO_RWLOCK_HAS_WAITERS);
+	}
+
+	pthread_mutex_unlock(mtx);
+	rc = pcs_context_is_canceled(co->ctx);
+	BUG_ON(!rc);
+	return rc;
+}
+
+int pcs_co_write_lock_cancelable(struct pcs_co_rwlock *lock)
+{
+	struct pcs_coroutine *co = pcs_current_co;
+	BUG_ON(!co);
+
+	ULONG_PTR self = (ULONG_PTR)co | PCS_CO_RWLOCK_WRITE_LOCKED;
+
+	/* Transition A->B */
+	if (likely(pcs_atomic_uptr_cas(&lock->val, 0, self) == 0))
+		return 0;
+
+	int rc;
+	if ((rc = pcs_cancelable_prepare_wait(&co->io_wait, co->ctx)))
+		return rc;
+
+	pthread_mutex_t *mtx = lock_static_mtx(lock);
+
+	ULONG_PTR val = pcs_atomic_uptr_load(&lock->val);
+	for (;;) {
+		if (val == 0) {
+			/* Transition A->B */
+			if ((val = pcs_atomic_uptr_cas(&lock->val, 0, self)) != 0)
+				continue;
+
+			pthread_mutex_unlock(mtx);
+			return 0;
+		}
+
+		if (val & PCS_CO_RWLOCK_HAS_WAITERS)
+			break;
+
+		/* Transition B->D or C->E */
+		ULONG_PTR res = pcs_atomic_uptr_cas(&lock->val, val, val | PCS_CO_RWLOCK_HAS_WAITERS);
+		if (res == val)
+			break;
+
+		val = res;
+	}
+
+	BUG_ON((val & ~PCS_CO_RWLOCK_HAS_WAITERS) == self);
+
+	struct wait_item w = {.co = co, .event = &co->io_wait.ev, .lock = lock, .get_holder = __pcs_co_rwlock_get_holder};
+	cd_list_add_tail(&w.lst, &lock->wwaiters);
+	pthread_mutex_unlock(mtx);
+
+	lock_wait(&w, NULL);
+
+	pthread_mutex_lock(mtx);
+	if (cd_list_empty(&w.lst)) {
+		pthread_mutex_unlock(mtx);
+		return 0;
+	}
+
+	cd_list_del(&w.lst);
+	if (cd_list_empty(&lock->wwaiters) && cd_list_empty(&lock->rwaiters)) {
+		/* Transition D->B or E->C */
+		pcs_atomic_uptr_and(&lock->val, ~PCS_CO_RWLOCK_HAS_WAITERS);
+	}
+
+	pthread_mutex_unlock(mtx);
+	rc = pcs_context_is_canceled(co->ctx);
+	BUG_ON(!rc);
+	return rc;
 }
 
 /* Handoff RW-lock ownerwhip to selected coroutine */

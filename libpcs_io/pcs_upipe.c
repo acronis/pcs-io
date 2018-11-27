@@ -38,10 +38,8 @@ struct upipe {
 	u8			buf[0];
 };
 
-static int out_upipe_write(struct pcs_co_file *file, const void *buf, int size, u64 offset, int *timeout, u32 flags)
+static int out_upipe_write(struct pcs_co_file *file, const void *buf, int size, u64 offset, u32 flags)
 {
-	BUG_ON(timeout);
-
 	if (!pcs_in_coroutine()) {
 		BUG_ON(!(flags & CO_IO_NOWAIT));
 		return 0;
@@ -133,10 +131,8 @@ done:
 	return res;
 }
 
-static int in_upipe_read(struct pcs_co_file *file, void *buf, int size, u64 offset, int *timeout, u32 flags)
+static int in_upipe_read(struct pcs_co_file *file, void *buf, int size, u64 offset, u32 flags)
 {
-	BUG_ON(timeout);
-
 	if (!pcs_in_coroutine()) {
 		BUG_ON(!(flags & CO_IO_NOWAIT));
 		return 0;
@@ -214,12 +210,12 @@ done:
 	return res;
 }
 
-static int in_upipe_write(struct pcs_co_file *file, const void *buf, int size, u64 offset, int *timeout, u32 flags)
+static int in_upipe_write(struct pcs_co_file *file, const void *buf, int size, u64 offset, u32 flags)
 {
 	BUG();
 }
 
-static int out_upipe_read(struct pcs_co_file *file, void *buf, int size, u64 offset, int *timeout, u32 flags)
+static int out_upipe_read(struct pcs_co_file *file, void *buf, int size, u64 offset, u32 flags)
 {
 	BUG();
 }
@@ -269,12 +265,16 @@ static int in_upipe_close(struct pcs_co_file *file)
 static struct pcs_co_file_ops in_upipe_ops  = {
 	.read	= in_upipe_read,
 	.write	= in_upipe_write,
+	.readv	= NULL,
+	.writev	= NULL,
 	.close	= in_upipe_close,
 };
 
 static struct pcs_co_file_ops out_upipe_ops  = {
 	.read	= out_upipe_read,
 	.write	= out_upipe_write,
+	.readv	= NULL,
+	.writev	= NULL,
 	.close	= out_upipe_close,
 };
 
@@ -305,16 +305,16 @@ struct duplex_upipe {
 	struct pcs_co_file	*out_file;
 };
 
-static int duplex_upipe_read(struct pcs_co_file *file, void *buf, int size, u64 offset, int *timeout, u32 flags)
+static int duplex_upipe_read(struct pcs_co_file *file, void *buf, int size, u64 offset, u32 flags)
 {
 	struct duplex_upipe *u = container_of(file, struct duplex_upipe, file);
-	return pcs_co_file_read_ex(u->in_file, buf, size, offset, timeout, flags);
+	return u->in_file->ops->read(u->in_file, buf, size, offset, flags);
 }
 
-static int duplex_upipe_write(struct pcs_co_file *file, const void *buf, int size, u64 offset, int *timeout, u32 flags)
+static int duplex_upipe_write(struct pcs_co_file *file, const void *buf, int size, u64 offset, u32 flags)
 {
 	struct duplex_upipe *u = container_of(file, struct duplex_upipe, file);
-	return pcs_co_file_write_ex(u->out_file, buf, size, offset, timeout, flags);
+	return u->out_file->ops->write(u->out_file, buf, size, offset, flags);
 }
 
 static int duplex_upipe_close(struct pcs_co_file *file)
@@ -329,6 +329,8 @@ static int duplex_upipe_close(struct pcs_co_file *file)
 static struct pcs_co_file_ops duplex_upipe_ops  = {
 	.read	= duplex_upipe_read,
 	.write	= duplex_upipe_write,
+	.readv	= NULL,
+	.writev	= NULL,
 	.close	= duplex_upipe_close,
 };
 

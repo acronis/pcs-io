@@ -19,6 +19,11 @@
 
 #ifdef PCS_USE_WATCHDOG
 
+__no_sanitize_thread static int get_poll_count(struct pcs_watchdog *wd)
+{
+	return wd->wd_poll_count;
+}
+
 static void dump_kstack(struct pcs_evloop* evloop)
 {
 	struct pcs_watchdog *wd = evloop->wd;
@@ -30,7 +35,7 @@ static void dump_kstack(struct pcs_evloop* evloop)
 	wd->wd_inactive_total += now - wd->wd_last_activity - wd->wd_accounted;
 	wd->wd_accounted = now - wd->wd_last_activity;
 
-	snprintf(buf, sizeof(buf), "/proc/%u/stack", wd->wd_pid);
+	snprintf(buf, sizeof(buf), "/proc/%lu/stack", evloop->thr_id);
 	stack_fp = fopen(buf, "r");
 	if (stack_fp == NULL)
 		pcs_log(LOG_ERR, "pcs watchdog failed to open %s: err=%d", buf, errno);
@@ -93,7 +98,7 @@ static void do_monitor(struct pcs_evloop * evloop)
 	struct pcs_watchdog *wd = evloop->wd;
 	int poll_count;
 
-	poll_count = wd->wd_poll_count;
+	poll_count = get_poll_count(wd);
 
 	if (poll_count != wd->wd_poll_checked || (poll_count & 1)) {
 		wd->wd_poll_checked = poll_count;
@@ -110,7 +115,7 @@ static pcs_thread_ret_t watchdog_thread(void * arg)
 	struct pcs_process *proc = arg;
 	struct pcs_watchdog *wd = proc->evloops[0].wd;
 
-	pcs_thread_setname(pcs_thread_self(), "watchdog");
+	pcs_thread_setname("watchdog");
 
 	pthread_mutex_lock(&wd->wd_mutex);
 	abs_time_t last = get_abs_time_ms();
@@ -131,11 +136,7 @@ static pcs_thread_ret_t watchdog_thread(void * arg)
 
 void pcs_watchdog_init_evloop(struct pcs_evloop *evloop)
 {
-	if (!__pcs_profiler_enabled)
-		return;
-
 	struct pcs_watchdog *wd = pcs_xzmalloc(sizeof(*wd));
-	wd->wd_pid = syscall(__NR_gettid);
 	wd->wd_poll_count = 0;
 	wd->wd_poll_checked = -1;
 	wd->wd_last_activity = get_abs_time_ms();

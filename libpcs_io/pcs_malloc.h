@@ -63,17 +63,14 @@ static __inline void pcs_fill_mem_header(struct mem_header *mh,
 #define TRACE_STR(x)	TRACE_STR2(x)
 
 #ifdef TRACE_ALLOC_SLOW
-#define TRACE_ALLOC(func, check, ...)	func (NULL, __FILE__ ":" TRACE_STR(__LINE__), check, __VA_ARGS__)
+#define TRACE_ALLOC(func, ...) \
+	func(NULL, __FILE__ ":" TRACE_STR(__LINE__), __VA_ARGS__)
 #else
-#define TRACE_ALLOC_(func, check, flags, ...) \
+#define TRACE_ALLOC(func, ...) \
 	({ \
-	 const char *tr_file = __FILE__ ":" TRACE_STR(__LINE__);	\
-	 static struct malloc_item *tr = NULL;				\
-	 if (unlikely(!tr)) pcs_malloc_item_init_(&tr, tr_file, flags);	\
-	 func (tr, tr_file, check, __VA_ARGS__);			\
+		static struct malloc_item *mi = NULL; \
+		func(&mi, __FILE__ ":" TRACE_STR(__LINE__), __VA_ARGS__); \
 	})
-
-#define TRACE_ALLOC(func, check, ...) TRACE_ALLOC_(func, check, 0, __VA_ARGS__)
 #endif
 
 #define pcs_malloc(sz)			TRACE_ALLOC(__pcs_malloc, 0, sz)
@@ -96,17 +93,17 @@ static __inline void pcs_fill_mem_header(struct mem_header *mh,
 #define pcs_free			__pcs_free	/* no macro arg!!! otherwise won't be possible to take address of function */
 #define pcs_alloc_account(ptr, sz)	__pcs_alloc_account(ptr, sz)
 
-PCS_API void pcs_malloc_item_init_(struct malloc_item **tr, const char *file, u32 flags);
+struct malloc_item *pcs_malloc_item_init(struct malloc_item **p_mi, const char *file, u32 flags);
 
 void pcs_account_alloc(struct malloc_item *mi, intptr_t size);
 
-PCS_API void *__pcs_malloc(struct malloc_item *mi, const char *file, int check, size_t size);
-PCS_API void *__pcs_zmalloc(struct malloc_item *mi, const char *file, int check, size_t size);
-PCS_API char *__pcs_strdup(struct malloc_item *mi, const char *file, int check, const char *src);
-PCS_API char *__pcs_strndup(struct malloc_item *mi, const char *file, int check, const char *src, size_t size);
-PCS_API void *__pcs_realloc(struct malloc_item *mi, const char *file, int check, void *block, size_t size);
-PCS_API char *__pcs_asprintf(struct malloc_item *mi, const char *file, int check, const char *fmt, ...) __printf(4, 5);
-PCS_API char *__pcs_vasprintf(struct malloc_item *mi, const char *file, int check, const char *fmt, va_list va);
+PCS_API void *__pcs_malloc(struct malloc_item **p_mi, const char *file, int check, size_t size);
+PCS_API void *__pcs_zmalloc(struct malloc_item **p_mi, const char *file, int check, size_t size);
+PCS_API char *__pcs_strdup(struct malloc_item **p_mi, const char *file, int check, const char *src);
+PCS_API char *__pcs_strndup(struct malloc_item **p_mi, const char *file, int check, const char *src, size_t size);
+PCS_API void *__pcs_realloc(struct malloc_item **p_mi, const char *file, int check, void *block, size_t size);
+PCS_API char *__pcs_asprintf(struct malloc_item **p_mi, const char *file, int check, const char *fmt, ...) __printf(4, 5);
+PCS_API char *__pcs_vasprintf(struct malloc_item **p_mi, const char *file, int check, const char *fmt, va_list va);
 
 PCS_API void __pcs_free(void *ptr);
 PCS_API void __pcs_alloc_account(void *ptr, ptrdiff_t sz);

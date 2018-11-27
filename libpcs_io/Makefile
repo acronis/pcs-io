@@ -1,11 +1,12 @@
 include ../Makefile.inc
 
 LIBPCS_IO=libpcs_io.so
-LIBOBJS=pcs_sock.o pcs_sock_conn.o pcs_sock_io.o pcs_sock_listen.o pcs_sock_ssl.o pcs_net_addr.o pcs_net_utils.o \
+LIBOBJS=pcs_sock.o pcs_sock_conn.o pcs_sock_io.o pcs_sock_listen.o pcs_net_addr.o pcs_net_utils.o \
+	pcs_sock_ssl.o pcs_sock_ssl_st.o pcs_sock_ssl_mt.o \
 	pcs_process.o pcs_epoll.o pcs_kqueue.o pcs_sun_port.o pcs_event_ioconn.o pcs_ioconn.o \
 	pcs_compat.o pcs_aio.o pcs_sync_io.o pcs_sync_ioreq.o pcs_file_job.o \
-	rbtree.o timer.o log.o bug.o md5.o crc32.o crc32_sse.o crc32_arm_wrapper.o crc64.o adler32.o \
-	pcs_profiler.o pcs_watchdog.o pool_allocator.o pcs_config_file.o user.o \
+	rbtree.o minheap.o timer.o log.o bug.o md5.o crc32.o crc32_sse.o crc32_arm_wrapper.o crc64.o adler32.o \
+	pcs_profiler.o pcs_watchdog.o logrotate.o pool_allocator.o pcs_config_file.o user.o \
 	pcs_signal.o pcs_random.o getopt_long.o \
 	pcs_malloc.o pcs_thread.o pcs_coroutine.o pcs_co_locks.o pcs_co_io.o \
 	lz4.o lz4_estimate.o parse_diskspace.o \

@@ -9,6 +9,8 @@
 
 #include <stdarg.h>
 
+struct iovec;
+
 struct bufqueue_shbuf {
 	void *buf;
 	int refcnt;
@@ -112,6 +114,7 @@ PCS_API void bufqueue_splice_tail(struct bufqueue *src, struct bufqueue *dst);
 PCS_API u32 bufqueue_get_size(const struct bufqueue *bq);
 /* Check whether @bq is empty. */
 PCS_API int bufqueue_empty(const struct bufqueue *bq);
+PCS_API int bufqueue_empty_unsafe(const struct bufqueue *bq);
 /* Check whether the current size of @bq is above the soft size limit. */
 PCS_API int bufqueue_no_space(const struct bufqueue *bq);
 
@@ -126,6 +129,18 @@ PCS_API int bufqueue_no_space(const struct bufqueue *bq);
    \returns the number of bytes actually retrieved from @bq
  */
 PCS_API u32 bufqueue_get_copy(struct bufqueue *bq, void *data, u32 size);
+
+/**
+   Retrieve bytes from the head of the queue @bq, and copy them into the buffers from @iov.
+   The call advances the current position of @bq. If @bq contains fewer bytes than requested,
+   then copy as many bytes as @bq contains.
+
+   \param @bq the buffer queue
+   \param @iovcnt number of destination buffers
+   \param @iov list of destination buffers
+   \returns the number of bytes actually retrieved from @bq
+ */
+PCS_API u32 bufqueue_get_copy_iovec(struct bufqueue *bq, int iovcnt, struct iovec *iov);
 
 /**
  * Retrieve @size bytes from head of the queue @bq.
@@ -213,17 +228,17 @@ PCS_API void bufqueue_clear(struct bufqueue *bq);
 
 struct malloc_item;
 
-PCS_API struct bufqueue_shbuf* __bufqueue_shbuf_alloc(struct malloc_item *mi, const char *file, int check, void *buf, u32 size);
+PCS_API struct bufqueue_shbuf* __bufqueue_shbuf_alloc(struct malloc_item **p_mi, const char *file, int check, void *buf, u32 size);
 
-PCS_API void __bufqueue_put(struct malloc_item *mi, const char *file, int check, struct bufqueue *bq, void *data, u32 size);
-PCS_API void __bufqueue_put_copy(struct malloc_item *mi, const char *file, int check, struct bufqueue *bq, const void *data, u32 size);
+PCS_API void __bufqueue_put(struct malloc_item **p_mi, const char *file, int check, struct bufqueue *bq, void *data, u32 size);
+PCS_API void __bufqueue_put_copy(struct malloc_item **p_mi, const char *file, int check, struct bufqueue *bq, const void *data, u32 size);
 
-PCS_API void __bufqueue_put_shbuf(struct malloc_item *mi, const char *file, int check, struct bufqueue *bq, struct bufqueue_shbuf *shbuf, const void *data, u32 size);
+PCS_API void __bufqueue_put_shbuf(struct malloc_item **p_mi, const char *file, int check, struct bufqueue *bq, struct bufqueue_shbuf *shbuf, const void *data, u32 size);
 
-PCS_API void __bufqueue_put_reference(struct malloc_item *mi, const char *file, int check, struct bufqueue *bq, const void *data, u32 size);
-PCS_API void __bufqueue_copy_referenced(struct malloc_item *mi, const char *file, int check, struct bufqueue *bq);
+PCS_API void __bufqueue_put_reference(struct malloc_item **p_mi, const char *file, int check, struct bufqueue *bq, const void *data, u32 size);
+PCS_API void __bufqueue_copy_referenced(struct malloc_item **p_mi, const char *file, int check, struct bufqueue *bq);
 
-PCS_API u32 __bufqueue_move(struct malloc_item *mi, const char *file, int check, struct bufqueue *dst, struct bufqueue *src, u32 size);
+PCS_API u32 __bufqueue_move(struct malloc_item **p_mi, const char *file, int check, struct bufqueue *dst, struct bufqueue *src, u32 size);
 
-PCS_API void __bufqueue_printf(struct malloc_item *mi, const char *file, int check, struct bufqueue *bq, const char *fmt, ...) __printf(5, 6);
-PCS_API void __bufqueue_vprintf(struct malloc_item *mi, const char *file, int check, struct bufqueue *bq, const char *fmt, va_list va);
+PCS_API void __bufqueue_printf(struct malloc_item **p_mi, const char *file, int check, struct bufqueue *bq, const char *fmt, ...) __printf(5, 6);
+PCS_API void __bufqueue_vprintf(struct malloc_item **p_mi, const char *file, int check, struct bufqueue *bq, const char *fmt, va_list va);

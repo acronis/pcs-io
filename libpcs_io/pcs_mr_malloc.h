@@ -47,21 +47,11 @@ struct pcs_mr_buf {
 
 struct malloc_item;
 
-void *__pcs_malloc_mmap(struct malloc_item *tr, int bugon_if_failed, size_t size);
+void *__pcs_malloc_mmap(struct malloc_item **p_mi, const char *file, int bugon_if_failed, int flags, size_t size);
 void  __pcs_free_mmap(void *block, size_t size);
 
-#define TRACE_MR_ALLOC_(func, check, flags, ...) \
-	({ \
-	 const char *tr_file = __FILE__ ":" TRACE_STR(__LINE__);	\
-	 static struct malloc_item *tr = NULL;				\
-	 if (unlikely(!tr)) pcs_malloc_item_init_(&tr, tr_file, flags);	\
-	 func (tr, check, __VA_ARGS__);			\
-	})
-
-#define TRACE_MR_ALLOC(func, check, ...) TRACE_MR_ALLOC_(func, check, 0, __VA_ARGS__)
-
-#define pcs_malloc_mmap(size)  TRACE_MR_ALLOC(__pcs_malloc_mmap, 0, size)
-#define pcs_xmalloc_mmap(size) TRACE_MR_ALLOC(__pcs_malloc_mmap, 1, size)
+#define pcs_malloc_mmap(size)  TRACE_ALLOC(__pcs_malloc_mmap, 0, 0, size)
+#define pcs_xmalloc_mmap(size) TRACE_ALLOC(__pcs_malloc_mmap, 1, 0, size)
 #define pcs_free_mmap(block, size) __pcs_free_mmap(block, size)
 
 #ifndef PCS_ENABLE_RDMA
@@ -82,13 +72,11 @@ enum {
 	MR_HASH_TYPE_MAX
 };
 
-void *__pcs_mr_malloc(struct malloc_item *tr, int bugon_if_failed, size_t size, int hash_type);
+void *__pcs_mr_malloc(struct malloc_item **p_mi, const char *file, int bugon_if_failed, size_t size, int hash_type);
 
-#define TRACE_MR_ALLOC_IN_POOL(func, check, ...) TRACE_MR_ALLOC_(func, check, PCS_MALLOC_F_IN_POOL, __VA_ARGS__)
-
-#define pcs_mr_malloc(size)       TRACE_MR_ALLOC_IN_POOL(__pcs_mr_malloc, 0, size, MR_HASH_TYPE_DEFAULT)
-#define pcs_mr_xmalloc(size)      TRACE_MR_ALLOC_IN_POOL(__pcs_mr_malloc, 1, size, MR_HASH_TYPE_DEFAULT)
-#define pcs_mr_xmalloc_mmap(size) TRACE_MR_ALLOC_IN_POOL(__pcs_mr_malloc, 1, size, MR_HASH_TYPE_MMAP)
+#define pcs_mr_malloc(size)       TRACE_ALLOC(__pcs_mr_malloc, 0, size, MR_HASH_TYPE_DEFAULT)
+#define pcs_mr_xmalloc(size)      TRACE_ALLOC(__pcs_mr_malloc, 1, size, MR_HASH_TYPE_DEFAULT)
+#define pcs_mr_xmalloc_mmap(size) TRACE_ALLOC(__pcs_mr_malloc, 1, size, MR_HASH_TYPE_MMAP)
 
 void pcs_mr_free(void *block);
 

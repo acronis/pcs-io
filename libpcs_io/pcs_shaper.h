@@ -4,7 +4,7 @@
 
 #pragma once
 #include "timer.h"
-#include "log.h"
+#include "bug.h"
 
 /* Implementation of Token Bucket Algorithm shaper for case with single bucket */
 

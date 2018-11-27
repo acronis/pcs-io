@@ -34,8 +34,15 @@
 #ifdef USE_VALGRIND
 #include <valgrind/valgrind.h>
 #endif
-#ifdef PCS_ADDRESS_SANITIZER
+#ifdef PCS_ADDR_SANIT
 #include <sanitizer/lsan_interface.h>
+#endif
+#ifdef PCS_THREAD_SANIT
+void *__tsan_co_current(void);
+void *__tsan_co_create(void);
+void __tsan_co_destroy(void *);
+void __tsan_co_switch(void *);
+void __tsan_co_set_name(void *, const char *);
 #endif
 
 /* very perf sensetive to be in production */
@@ -95,7 +102,7 @@ static struct pcs_coroutine* get_runnable_co(struct pcs_evloop *evloop)
 static void pcs_co_destroy(struct pcs_coroutine * co)
 {
 #ifdef USE_VALGRIND
-	VALGRIND_STACK_DEREGISTER(co->valgrind_stack_id);
+	VALGRIND_STACK_DEREGISTER(co->valgrind.stack_id);
 #endif
 
 #ifndef __WINDOWS__
@@ -187,9 +194,12 @@ struct co_migrate_job
 	struct pcs_file_job_conn	*io;
 	unsigned int			hash;
 	struct pcs_ucontext		context;
-#ifdef PCS_ADDRESS_SANITIZER
+#ifdef PCS_ADDR_SANIT
 	const void	 		*stack_bottom;
 	size_t				stack_size;
+#endif
+#ifdef PCS_THREAD_SANIT
+	void				*tsan_state;
 #endif
 };
 
@@ -222,6 +232,8 @@ static void pcs_co_switch_finish(struct pcs_coroutine *current)
 	if (unlikely(!evloop))
 		return;
 
+	__tsan_acquire(evloop);
+
 	struct pcs_coroutine *co = evloop->co_current;
 	if (evloop->wait_on) {
 		/* We have switch away from the coroutine that called pcs_co_event_wait().
@@ -246,11 +258,22 @@ static void pcs_co_switch_finish(struct pcs_coroutine *current)
 		case CO_MIGRATED:
 			pcs_file_job_submit_hash(co->migrate_job->io, &co->migrate_job->job, co->migrate_job->hash);
 			break;
+
+		case CO_ZOMBIE:
+#ifdef PCS_THREAD_SANIT
+			if (!co->tsan.keep_state) {
+				__tsan_co_destroy(co->tsan.state);
+				co->tsan.state = NULL;
+			}
+#endif
+			break;
 		}
 	}
 
 	current->sched_seq = evloop->co_sched_seq;
 	pcs_co_set_current(current);
+
+	__tsan_release(evloop);
 }
 
 static void pcs_co_switch(struct pcs_coroutine * current, struct pcs_coroutine * co)
@@ -264,13 +287,18 @@ static void pcs_co_switch(struct pcs_coroutine * current, struct pcs_coroutine *
 	evloop->co_ctx_switches++;
 	current->co_ctx_switches++;
 
-#ifdef PCS_ADDRESS_SANITIZER
-	BUG_ON(!co->stack_bottom || !co->stack_size);
+#ifdef PCS_ADDR_SANIT
+	BUG_ON(!co->asan.stack_bottom || !co->asan.stack_size);
 	void *fake_stack;
-	__sanitizer_start_switch_fiber(&fake_stack, co->stack_bottom, co->stack_size);
+	__sanitizer_start_switch_fiber(&fake_stack, co->asan.stack_bottom, co->asan.stack_size);
+#endif
+#ifdef PCS_THREAD_SANIT
+	void *tsan_state = co->tsan.state;
+	__tsan_release(evloop);
+	__tsan_co_switch(tsan_state);
 #endif
 	pcs_ucontext_switch(&current->context, &co->context);
-#ifdef PCS_ADDRESS_SANITIZER
+#ifdef PCS_ADDR_SANIT
 	if (pcs_co_state(current) == CO_MIGRATED)
 		__sanitizer_finish_switch_fiber(fake_stack, &current->migrate_job->stack_bottom, &current->migrate_job->stack_size);
 	else
@@ -319,6 +347,8 @@ static void pcs_co_pool_apply_limit(struct pcs_evloop *evloop)
 /* Internal for pcs_process event loop: coroutines are processed using this function */
 void pcs_co_run(struct pcs_evloop * evloop)
 {
+	__tsan_acquire(evloop);
+
 	struct pcs_coroutine *co = get_runnable_co(evloop);
 	if (co)
 		pcs_co_switch(evloop->co_current, co);
@@ -380,6 +410,9 @@ void pcs_co_bt(void)
 void pcs_co_schedule(void)
 {
 	struct pcs_evloop *evloop = pcs_current_evloop;
+
+	__tsan_acquire(evloop);
+
 	struct pcs_coroutine *co = get_runnable_co(evloop);
 	if (!co)
 		co = evloop->co_idle;
@@ -393,18 +426,8 @@ static void PCS_UCONTEXT_FUNC _coroutine_start(void *arg)
 
 	struct pcs_coroutine * co = arg;
 
-#ifdef PCS_ADDRESS_SANITIZER
-	const void *stack_bottom;
-	size_t stack_size;
-	__sanitizer_finish_switch_fiber(NULL, &stack_bottom, &stack_size);
-
-	/* When we arrive here for the first time, we has switched from the original
-	 * stack of eventloop thread. It is the stack we will use later for co_idle */
-	struct pcs_coroutine *co_idle = pcs_current_evloop->co_idle;
-	if (!co_idle->stack_size) {
-		co_idle->stack_bottom = stack_bottom;
-		co_idle->stack_size = stack_size;
-	}
+#ifdef PCS_ADDR_SANIT
+	__sanitizer_finish_switch_fiber(NULL, NULL, NULL);
 #endif
 
 	pcs_co_switch_finish(co);
@@ -481,16 +504,28 @@ static void pcs_co_alloc_ctx(struct pcs_coroutine * co)
 	}
 #endif /* __WINDOWS__ */
 
-#ifdef PCS_ADDRESS_SANITIZER
-	co->stack_bottom = co->stack + PCS_CO_STACK_SIZE + page_size;
-	co->stack_size = PCS_CO_STACK_SIZE;
+#ifdef PCS_ADDR_SANIT
+	co->asan.stack_bottom = co->stack + PCS_CO_STACK_SIZE + page_size;
+	co->asan.stack_size = PCS_CO_STACK_SIZE;
+#endif
+#ifdef PCS_THREAD_SANIT
+	co->tsan.state = __tsan_co_create();
 #endif
 #ifdef USE_VALGRIND
-	co->valgrind_stack_id = VALGRIND_STACK_REGISTER(co->stack + page_size, co->stack + page_size + PCS_CO_STACK_SIZE);
+	co->valgrind.stack_id = VALGRIND_STACK_REGISTER(co->stack + page_size, co->stack + page_size + PCS_CO_STACK_SIZE);
 #endif
 
 	/* account allocated stack to co allocation */
 	pcs_alloc_account(co, PCS_CO_STACK_SIZE);
+}
+
+static void pcs_co_refresh_ctx(struct pcs_coroutine * co)
+{
+#ifdef PCS_THREAD_SANIT
+	unsigned int page_size = sysconf(_SC_PAGESIZE);
+	pcs_ucontext_init(&co->context, (u8 *)co->stack + page_size, PCS_CO_STACK_SIZE, _coroutine_start, co);
+	co->tsan.state = __tsan_co_create();
+#endif
 }
 
 static struct pcs_coroutine * pcs_co_alloc(struct pcs_evloop * evloop)
@@ -501,6 +536,8 @@ static struct pcs_coroutine * pcs_co_alloc(struct pcs_evloop * evloop)
 	if (!co) {
 		co = __pcs_co_alloc(evloop->proc, 0);
 		pcs_co_alloc_ctx(co);
+	} else {
+		pcs_co_refresh_ctx(co);
 	}
 
 	return co;
@@ -598,7 +635,7 @@ static void pcs_co_filejob_init(struct pcs_process * proc)
 		pcs_file_job_set_queues_threads(proc->co_cpu, 1, nr);
 	}
 
-	if (!proc->co_ssl) {
+	if (!proc->co_ssl && proc->nr_evloops == 1) {
 		int nr = pcs_is_aesni_supported() ? 2 : 4;
 		if (nr > nr_processors)
 			nr = nr_processors;
@@ -647,7 +684,7 @@ static void _co_filejob_done(void * arg)
 
 int pcs_co_filejob(struct pcs_file_job_conn * io, int (*func)(void *), void * data)
 {
-	return pcs_co_filejob_hash(io, func, data, (io->seq++) / 8);
+	return pcs_co_filejob_hash(io, func, data, io->seq++);
 }
 
 int pcs_co_filejob_hash(struct pcs_file_job_conn * io, int (*func)(void *), void * data, unsigned int hash)
@@ -665,13 +702,21 @@ int pcs_co_filejob_hash(struct pcs_file_job_conn * io, int (*func)(void *), void
 	return co_fj.fj.retval;
 }
 
+void pcs_co_set_name_fixed(struct pcs_coroutine * co, const char *name)
+{
+	co->name = name;
+#ifdef PCS_THREAD_SANIT
+	__tsan_co_set_name(co->tsan.state, name);
+#endif
+}
+
 void pcs_co_set_name(struct pcs_coroutine * co, const char *fmt, ...)
 {
 	va_list va;
 	va_start(va, fmt);
 	vsnprintf(co->name_buf, sizeof(co->name_buf), fmt, va);
 	va_end(va);
-	co->name = co->name_buf;
+	pcs_co_set_name_fixed(co, co->name_buf);
 }
 
 static int migrate_job_run(void *arg)
@@ -683,12 +728,17 @@ static int migrate_job_run(void *arg)
 #ifdef __WINDOWS__
 	co->migrate_job->context.fiber = GetCurrentFiber();
 #endif
-#ifdef PCS_ADDRESS_SANITIZER
+#ifdef PCS_ADDR_SANIT
 	void *fake_stack;
-	__sanitizer_start_switch_fiber(&fake_stack, co->stack_bottom, co->stack_size);
+	__sanitizer_start_switch_fiber(&fake_stack, co->asan.stack_bottom, co->asan.stack_size);
+#endif
+#ifdef PCS_THREAD_SANIT
+	co->migrate_job->tsan_state = __tsan_co_current();
+	__tsan_release(co->migrate_job);
+	__tsan_co_switch(co->tsan.state);
 #endif
 	pcs_ucontext_switch(&co->migrate_job->context, &co->context);
-#ifdef PCS_ADDRESS_SANITIZER
+#ifdef PCS_ADDR_SANIT
 	__sanitizer_finish_switch_fiber(fake_stack, NULL, NULL);
 #endif
 	pcs_current_co = NULL;
@@ -735,12 +785,16 @@ void pcs_co_migrate_from_thread(struct pcs_coroutine * co)
 {
 	BUG_ON(pcs_co_state(co) != CO_MIGRATED);
 
-#ifdef PCS_ADDRESS_SANITIZER
+#ifdef PCS_ADDR_SANIT
 	void *fake_stack;
 	__sanitizer_start_switch_fiber(&fake_stack, co->migrate_job->stack_bottom, co->migrate_job->stack_size);
 #endif
+#ifdef PCS_THREAD_SANIT
+	__tsan_acquire(co->migrate_job);
+	__tsan_co_switch(co->migrate_job->tsan_state);
+#endif
 	pcs_ucontext_switch(&co->context, &co->migrate_job->context);
-#ifdef PCS_ADDRESS_SANITIZER
+#ifdef PCS_ADDR_SANIT
 	__sanitizer_finish_switch_fiber(fake_stack, NULL, NULL);
 #endif
 	pcs_co_switch_finish(co);
@@ -772,6 +826,9 @@ struct thread_coroutine
 	pthread_cond_t			wait;
 	pthread_mutex_t			wait_mutex;
 	struct pcs_ucontext		wait_context;
+#ifdef PCS_THREAD_SANIT
+	void				*wait_tsan_state;
+#endif
 	u64				mstack_guard;	/* to detect stack overflow */
 #ifndef __WINDOWS__
 	__pre_aligned(16) u8		mstack[PCS_CO_WAITING_THREAD_SS] __aligned(16);
@@ -788,8 +845,8 @@ static void PCS_UCONTEXT_FUNC _co_thread_suspend(void *arg)
 
 	/* Thread context with ministack */
 
-#ifdef PCS_ADDRESS_SANITIZER
-	__sanitizer_finish_switch_fiber(NULL, &tco->co.stack_bottom, &tco->co.stack_size);
+#ifdef PCS_ADDR_SANIT
+	__sanitizer_finish_switch_fiber(NULL, &tco->co.asan.stack_bottom, &tco->co.asan.stack_size);
 #endif
 
 	tco->done = 0;
@@ -810,8 +867,13 @@ static void PCS_UCONTEXT_FUNC _co_thread_suspend(void *arg)
 	BUG_ON(tco->mstack_guard != MSTACK_GUARD);
 
 	/* Jump back to thread with normal stack */
-#ifdef PCS_ADDRESS_SANITIZER
-	__sanitizer_start_switch_fiber(NULL, tco->co.stack_bottom, tco->co.stack_size);
+#ifdef PCS_ADDR_SANIT
+	__sanitizer_start_switch_fiber(NULL, tco->co.asan.stack_bottom, tco->co.asan.stack_size);
+#endif
+#ifdef PCS_THREAD_SANIT
+	void *tsan_state = tco->co.tsan.state;
+	__tsan_release(&tco->wait_context);
+	__tsan_co_switch(tsan_state);
 #endif
 	pcs_ucontext_switch(&tco->wait_context, &tco->co.context);
 	BUG();
@@ -831,12 +893,12 @@ struct pcs_coroutine * pcs_move_to_coroutine(struct pcs_process * proc)
 #ifndef __WINDOWS__
 	pcs_ucontext_init(&tco->wait_context, tco->mstack, PCS_CO_WAITING_THREAD_SS, _co_thread_suspend, tco);
 #else
-	co->context.fiber = ConvertThreadToFiberEx(NULL, 0);
+	co->context.fiber = ConvertThreadToFiber(NULL);
 	if (co->context.fiber != NULL) {
 		tco->new_fiber = 1;
 	} else {
 		if (GetLastError() != ERROR_ALREADY_FIBER) {
-			pcs_log_syserror(LOG_ERR, GetLastError(), "pcs_move_to_coroutine: ConvertThreadToFiberEx failed");
+			pcs_log_syserror(LOG_ERR, GetLastError(), "pcs_move_to_coroutine: ConvertThreadToFiber failed");
 			BUG();
 		}
 		co->context.fiber = GetCurrentFiber();
@@ -851,26 +913,22 @@ struct pcs_coroutine * pcs_move_to_coroutine(struct pcs_process * proc)
 
 	/* Now we are still in thread context with normal thread stack */
 
-#ifdef PCS_ADDRESS_SANITIZER
+#ifdef PCS_ADDR_SANIT
 	void *fake_stack;
 	__sanitizer_start_switch_fiber(&fake_stack, tco->mstack + PCS_CO_WAITING_THREAD_SS, PCS_CO_WAITING_THREAD_SS);
 #endif
+#ifdef PCS_THREAD_SANIT
+	tco->co.tsan.state = __tsan_co_current();
+	tco->co.tsan.keep_state = 1;
+	tco->wait_tsan_state = __tsan_co_create();
+	__tsan_co_switch(tco->wait_tsan_state);
+#endif
 #ifdef USE_VALGRIND
-	tco->co.valgrind_stack_id = VALGRIND_STACK_REGISTER(tco->mstack, tco->mstack + PCS_CO_WAITING_THREAD_SS);
+	tco->co.valgrind.stack_id = VALGRIND_STACK_REGISTER(tco->mstack, tco->mstack + PCS_CO_WAITING_THREAD_SS);
 #endif
 	pcs_ucontext_switch(&co->context, &tco->wait_context);
-#ifdef PCS_ADDRESS_SANITIZER
-	const void *stack_bottom;
-	size_t stack_size;
-	__sanitizer_finish_switch_fiber(fake_stack, &stack_bottom, &stack_size);
-
-	/* When we arrive here for the first time, we has switched from the original
-	 * stack of eventloop thread. It is the stack we will use later for co_idle */
-	struct pcs_coroutine *co_idle = pcs_current_evloop->co_idle;
-	if (!co_idle->stack_size) {
-		co_idle->stack_bottom = stack_bottom;
-		co_idle->stack_size = stack_size;
-	}
+#ifdef PCS_ADDR_SANIT
+	__sanitizer_finish_switch_fiber(fake_stack, NULL, NULL);
 #endif
 
 	/* Now we are in coroutine context with thread stack */
@@ -915,8 +973,12 @@ void pcs_move_from_coroutine(void)
 	pcs_co_schedule();
 
 	/* Back to thread context with thread stack */
+#ifdef PCS_THREAD_SANIT
+	__tsan_acquire(&tco->wait_context);
+	__tsan_co_destroy(tco->wait_tsan_state);
+#endif
 #ifdef USE_VALGRIND
-	VALGRIND_STACK_DEREGISTER(tco->co.valgrind_stack_id);
+	VALGRIND_STACK_DEREGISTER(tco->co.valgrind.stack_id);
 #endif
 	pthread_mutex_lock(&proc->co_list_mutex);
 	BUG_ON(!proc->co_list.nr);
@@ -947,6 +1009,40 @@ void pcs_co_init_proc(struct pcs_process * proc)
 	pcs_co_filejob_init(proc);
 }
 
+#ifdef PCS_ADDR_SANIT
+/* Address sanitizer does not provide API to get stack bounds of current thread.
+ * We workaround it by switching to other context. Sanitizer report stack bounds
+ * of previous context (our thread) from __sanitizer_finish_switch_fiber().
+ * After that we can switch back into thread context. */
+static void PCS_UCONTEXT_FUNC asan_init_co_idle_helper(void *arg)
+{
+	PCS_UCONTEXT_TOPMOST;
+
+	struct pcs_coroutine *co = arg;
+	__sanitizer_finish_switch_fiber(NULL, &co->asan.stack_bottom, &co->asan.stack_size);
+	__sanitizer_start_switch_fiber(NULL, co->asan.stack_bottom, co->asan.stack_size);
+	struct pcs_ucontext context;
+	pcs_ucontext_switch(&context, &co->context);
+	BUG();
+}
+
+static void asan_init_co_idle(struct pcs_coroutine *co)
+{
+	void *stack = pcs_xmalloc(PCS_CO_WAITING_THREAD_SS);
+	struct pcs_ucontext context;
+	pcs_ucontext_init(&context, stack, PCS_CO_WAITING_THREAD_SS, asan_init_co_idle_helper, co);
+	void *fake_stack;
+	__sanitizer_start_switch_fiber(&fake_stack, stack, PCS_CO_WAITING_THREAD_SS);
+	pcs_ucontext_switch(&co->context, &context);
+	__sanitizer_finish_switch_fiber(fake_stack, NULL, NULL);
+	pcs_free(stack);
+}
+#else
+static void asan_init_co_idle(struct pcs_coroutine *co)
+{
+}
+#endif
+
 void pcs_co_init_evloop(struct pcs_evloop * evloop)
 {
 	cd_list_init(&evloop->co_runqueue[0].list);
@@ -955,12 +1051,16 @@ void pcs_co_init_evloop(struct pcs_evloop * evloop)
 
 	struct pcs_coroutine *co_idle = __pcs_co_alloc(evloop->proc, 0);
 #ifdef __WINDOWS__
-	co_idle->context.fiber = ConvertThreadToFiberEx(NULL, 0);
+	co_idle->context.fiber = ConvertThreadToFiber(NULL);
 	if (co_idle->context.fiber == NULL) {
-		pcs_log_syserror(LOG_ERR, GetLastError(), "pcs_co_init_evloop: ConvertThreadToFiberEx failed");
+		pcs_log_syserror(LOG_ERR, GetLastError(), "pcs_co_init_evloop: ConvertThreadToFiber failed");
 		BUG();
 	}
 #endif
+#ifdef PCS_THREAD_SANIT
+	co_idle->tsan.state = __tsan_co_current();
+#endif
+	asan_init_co_idle(co_idle);
 	evloop->co_idle = co_idle;
 	pcs_atomic32_store(&co_idle->state, CO_IDLE);
 	co_idle->evloop = evloop;

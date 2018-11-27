@@ -16,7 +16,7 @@
 #include <signal.h>
 #endif
 #include <string.h>
-#ifdef PCS_ADDRESS_SANITIZER
+#ifdef PCS_ADDR_SANIT
 #include <sanitizer/lsan_interface.h>
 #endif
 
@@ -166,7 +166,7 @@ int pcs_signal_set_defaults(struct pcs_process *proc)
 
 int pcs_signal_set_fatal_handlers(void)
 {
-#if defined(__LINUX__) || defined(__MAC__)
+#if (defined(__LINUX__) || defined(__MAC__)) && !defined(PCS_THREAD_SANIT)
 	struct sigaction sa;
 	stack_t ss;
 	memset(&sa, 0, sizeof(sa));
@@ -176,7 +176,7 @@ int pcs_signal_set_fatal_handlers(void)
 
 	/* create alternative stack if possible */
 	ss.ss_sp = pcs_xmalloc(2 * SIGSTKSZ);
-#ifdef PCS_ADDRESS_SANITIZER
+#ifdef PCS_ADDR_SANIT
 	__lsan_ignore_object(ss.ss_sp);
 #endif
 	ss.ss_flags = 0;

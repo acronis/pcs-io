@@ -11,7 +11,6 @@
 #include "pcs_sock.h"
 #include "pcs_process.h"
 #include "pcs_error.h"
-#include "log.h"
 #include "pcs_net.h"
 #include "pcs_rdma_prot.h"
 

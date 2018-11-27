@@ -9,8 +9,8 @@
 #include "pcs_sock.h"
 #include "pcs_process.h"
 #include "pcs_error.h"
-#include "log.h"
 #include "pcs_net.h"
+#include "bug.h"
 
 #define PCS_MSG_MAX_CALENDAR 64
 #define PCS_SIO_TIMEOUT	(60*1000)

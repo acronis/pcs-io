@@ -82,6 +82,7 @@ char * pcs_utf16_to_utf8(const WCHAR * wstr, int wlen)
 	return str;
 }
 
+#if (_MSC_VER < 1900)
 int pcs_vsnprintf(char *str, size_t size, const char *format, va_list ap)
 {
 	int count = -1;
@@ -108,6 +109,7 @@ int pcs_snprintf(char *str, size_t size, const char *format, ...)
 
 	return count;
 }
+#endif /* (_MSC_VER < 1900) */
 #endif /* __WINDOWS__ */
 
 unsigned int pcs_nr_processors(void)
