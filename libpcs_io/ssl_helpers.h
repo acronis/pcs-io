@@ -22,13 +22,13 @@ PCS_API char* pcs_cert_to_pem(X509 *c);
 PCS_API char * pcs_pkey_to_pem(EVP_PKEY *key);
 /* read X509 certificate from PEM */
 PCS_API X509* pcs_cert_from_pem(const char *pem, int *out_sz);
-PCS_API X509* pcs_cert_from_pem_file(const char *path);
+PCS_API int pcs_cert_from_pem_file(const char *path, X509 **res);
 /* read private key from PEM */
 PCS_API EVP_PKEY *pcs_pkey_from_pem(const char *pem, int *out_sz);
-PCS_API EVP_PKEY *pcs_pkey_from_pem_file(const char *path);
+PCS_API int pcs_pkey_from_pem_file(const char *path, EVP_PKEY **res);
 /* read a CRL from PEM */
 PCS_API X509_CRL* pcs_crl_from_pem(const char *pem, int *out_sz);
-PCS_API X509_CRL* pcs_crl_from_pem_file(const char *path);
+PCS_API int pcs_crl_from_pem_file(const char *path, X509_CRL **res);
 /* create X509 certificate and sign it by pkey */
 X509* pcs_create_cert(EVP_PKEY *pkey, const unsigned char *cn);
 /* free resources used by EVP_PKEY private key*/

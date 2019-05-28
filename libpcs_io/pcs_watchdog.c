@@ -19,9 +19,9 @@
 
 #ifdef PCS_USE_WATCHDOG
 
-__no_sanitize_thread static int get_poll_count(struct pcs_watchdog *wd)
+__no_sanitize_thread static u32 get_poll_count(struct pcs_evloop* evloop)
 {
-	return wd->wd_poll_count;
+	return evloop->poll_count;
 }
 
 static void dump_kstack(struct pcs_evloop* evloop)
@@ -36,7 +36,7 @@ static void dump_kstack(struct pcs_evloop* evloop)
 	wd->wd_accounted = now - wd->wd_last_activity;
 
 	snprintf(buf, sizeof(buf), "/proc/%lu/stack", evloop->thr_id);
-	stack_fp = fopen(buf, "r");
+	stack_fp = fopen(buf, "re");
 	if (stack_fp == NULL)
 		pcs_log(LOG_ERR, "pcs watchdog failed to open %s: err=%d", buf, errno);
 
@@ -55,40 +55,40 @@ static void dump_kstack(struct pcs_evloop* evloop)
 	if (stack_fp) {
 		while (fgets(buf, sizeof(buf) - 1, stack_fp)) {
 			buf[sizeof(buf) - 1] = 0;
-			pcs_log(LOG_ERR|LOG_NONL, "%s", buf);
+			pcs_log(LOG_ERR, "%s", buf);
 		}
 		if (ferror(stack_fp))
 			pcs_log(LOG_ERR, "Stack is unavailable: err=%d", errno);
 		fclose(stack_fp);
 	}
 
-	stack_fp = fopen("/proc/meminfo", "r");
+	stack_fp = fopen("/proc/meminfo", "re");
 	if (stack_fp == NULL)
 		return;
 
 	while (fgets(buf, sizeof(buf) - 1, stack_fp)) {
 		buf[sizeof(buf) - 1] = 0;
-		pcs_log(LOG_ERR|LOG_NONL, "%s", buf);
+		pcs_log(LOG_ERR, "%s", buf);
 	}
 	fclose(stack_fp);
 
-	stack_fp = fopen("/proc/vz/latency", "r");
+	stack_fp = fopen("/proc/vz/latency", "re");
 	if (stack_fp == NULL)
 		return;
 
 	while (fgets(buf, sizeof(buf) - 1, stack_fp)) {
 		buf[sizeof(buf) - 1] = 0;
-		pcs_log(LOG_ERR|LOG_NONL, "%s", buf);
+		pcs_log(LOG_ERR, "%s", buf);
 	}
 	fclose(stack_fp);
 
-	stack_fp = popen("ps axv", "r");
+	stack_fp = popen("ps axv", "re");
 	if (stack_fp == NULL)
 		return;
 
 	while (fgets(buf, sizeof(buf) - 1, stack_fp)) {
 		buf[sizeof(buf) - 1] = 0;
-		pcs_log(LOG_ERR|LOG_NONL, "%s", buf);
+		pcs_log(LOG_ERR, "%s", buf);
 	}
 	pclose(stack_fp);
 }
@@ -96,9 +96,7 @@ static void dump_kstack(struct pcs_evloop* evloop)
 static void do_monitor(struct pcs_evloop * evloop)
 {
 	struct pcs_watchdog *wd = evloop->wd;
-	int poll_count;
-
-	poll_count = get_poll_count(wd);
+	u32 poll_count = get_poll_count(evloop);
 
 	if (poll_count != wd->wd_poll_checked || (poll_count & 1)) {
 		wd->wd_poll_checked = poll_count;
@@ -137,11 +135,8 @@ static pcs_thread_ret_t watchdog_thread(void * arg)
 void pcs_watchdog_init_evloop(struct pcs_evloop *evloop)
 {
 	struct pcs_watchdog *wd = pcs_xzmalloc(sizeof(*wd));
-	wd->wd_poll_count = 0;
-	wd->wd_poll_checked = -1;
 	wd->wd_last_activity = get_abs_time_ms();
-	wd->wd_accounted = 0;
-	wd->wd_inactive_total = 0;
+	wd->wd_poll_checked = ~0;
 	evloop->wd = wd;
 }
 
@@ -177,18 +172,6 @@ void pcs_watchdog_stop(struct pcs_process *proc)
 		pcs_free(proc->evloops[i].wd);
 		proc->evloops[i].wd = NULL;
 	}
-}
-
-void pcs_watchdog_enter_poll(struct pcs_evloop * evloop)
-{
-	if (evloop->wd)
-		evloop->wd->wd_poll_count++;
-}
-
-void pcs_watchdog_leave_poll(struct pcs_evloop * evloop)
-{
-	if (evloop->wd)
-		evloop->wd->wd_poll_count++;
 }
 
 #endif /* PCS_USE_WATCHDOG */

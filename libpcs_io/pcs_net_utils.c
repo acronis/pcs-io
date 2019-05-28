@@ -29,6 +29,10 @@
 #include "log.h"
 #include "pcs_malloc.h"
 
+#ifndef SOCK_CLOEXEC
+#define SOCK_CLOEXEC	0
+#endif
+
 int pcs_resolve_hostname(const char *host, const char *svc, PCS_NET_ADDR_T addr[], int *nr, int passive)
 {
 	int rc;
@@ -152,7 +156,7 @@ int pcs_get_default_addr(PCS_NET_ADDR_T *addr)
 	FILE *fi;
 	/* Note that this function works only for IPv4 addresses */
 	const char *route_file = "/proc/net/route";
-	fi = fopen(route_file, "r");
+	fi = fopen(route_file, "re");
 	if (!fi) {
 		pcs_log(LOG_ERR, "Unable open %s - %s", route_file, strerror(errno));
 		return -1;
@@ -188,7 +192,7 @@ int pcs_get_default_addr(PCS_NET_ADDR_T *addr)
 
 int pcs_is_net_addr_avail(PCS_NET_ADDR_T *addr)
 {
-	int sock = socket(PF_INET, SOCK_STREAM, 0);
+	int sock = socket(PF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	if (sock < 0) {
 		pcs_log(LOG_ERR, "Failed to create socket: %s", strerror(errno));
 		return -1;

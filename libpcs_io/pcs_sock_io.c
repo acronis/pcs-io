@@ -7,11 +7,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <stdio.h>
 
 #include <unistd.h>
 #include <fcntl.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <sys/uio.h>
 
 #include "pcs_sock_io.h"
 #include "pcs_poll.h"
@@ -20,6 +22,8 @@
 #include "bufqueue.h"
 #include "pcs_errno.h"
 #include "pcs_splice.h"
+#include "pcs_co_io.h"
+#include "pcs_exec.h"
 #include "log.h"
 #include "bug.h"
 
@@ -222,12 +226,17 @@ static void data_ready(struct pcs_ioconn *conn)
 	}
 }
 
+#define DEFAULT_IOV_SIZE 4
+
 static void write_space(struct pcs_ioconn * conn)
 {
 	struct pcs_sockio * sio = sio_from_ioconn(conn);
 	int done = 0;
 	int count = 0;
 	struct pcs_msg * msg;
+	struct iovec iov_on_stack[DEFAULT_IOV_SIZE];
+	struct iovec * iov = iov_on_stack;
+	int iov_size = DEFAULT_IOV_SIZE;
 
 	conn->next_mask &= ~POLLOUT;
 
@@ -246,42 +255,58 @@ static void write_space(struct pcs_ioconn * conn)
 
 		while (sio->write_offset < msg->size) {
 			void * buf = NULL;
-			int copy;
+			int len;
 			int n;
 			int offset = sio->write_offset;
+			int iovcnt = 0;
 
-			if (sio->splice_wbuf == NULL) {
-				buf = msg->get_chunk(msg, offset, &copy);
-				unwind_mr_buf(&buf, &copy);
+			while (sio->splice_wbuf == NULL && offset < msg->size) {
+				buf = msg->get_chunk(msg, offset, &len);
+				BUG_ON(buf == NULL);
+				unwind_mr_buf(&buf, &len);
 
-				if (copy == -1) {
-					BUG_ON(buf == NULL);
+				if (len == -1) {
+					/* we expect that splice doesn't coexist with non-splice */
+					BUG_ON(iovcnt > 0);
 					sio->splice_wbuf = buf;
-					copy = pcs_splice_buf_bytes(sio->splice_wbuf);
+					break;
 				}
-			} else
-				copy = pcs_splice_buf_bytes(sio->splice_wbuf);
+				/* in many cases the returned length doesn't take into account the msg size */
+				if (len > msg->size - offset)
+					len = msg->size - offset;
 
-			if (copy > msg->size - offset)
-				copy = msg->size - offset;
+				/* allocate larger iovec, if needed */
+				if (iovcnt == iov_size) {
+					iov_size += DEFAULT_IOV_SIZE;
+					iov = pcs_realloc(iov != iov_on_stack ? iov : NULL, sizeof(struct iovec) * iov_size);
+				}
 
-			if (sio->splice_wbuf) {
-				n = pcs_splice_buf_send(conn->fd, sio->splice_wbuf, copy);
+				/* store a single write in iovec entry */
+				iov[iovcnt].iov_base = buf;
+				iov[iovcnt].iov_len = len;
+				iovcnt++;
+				offset += len;
+			}
+
+			/* send the whole iovec or splice */
+			if (iovcnt > 0)
+				n = writev(conn->fd, iov, iovcnt);
+			else {
+				BUG_ON(sio->splice_wbuf == NULL);
+				len = pcs_splice_buf_bytes(sio->splice_wbuf);
+
+				n = pcs_splice_buf_send(conn->fd, sio->splice_wbuf, len);
 				if (pcs_splice_buf_bytes(sio->splice_wbuf) == 0) {
 					pcs_splice_buf_put(sio->splice_wbuf);
 					sio->splice_wbuf = NULL;
 				}
 				if (n < 0)
 					errno = -n;
-			} else
-				n = send(conn->fd, buf, copy, MSG_DONTWAIT);
-			if (n > 0) {
-				sio->write_offset = offset + n;
-				done = 1;
-			} else {
-				if (n == 0)
-					BUG();
+			}
 
+			BUG_ON(n == 0);
+
+			if (n < 0) {
 				if (errno_eagain(pcs_sock_errno())) {
 					long timeout;
 					conn->next_mask |= POLLOUT;
@@ -291,11 +316,13 @@ static void write_space(struct pcs_ioconn * conn)
 						sio_abort(sio, PCS_ERR_WRITE_TIMEOUT);
 					else
 						mod_timer(&sio->write_timer, timeout);
-					return;
+					goto exit;
 				}
 				sio_abort(sio, PCS_ERR_NET_ABORT);
-				return;
+				goto exit;
 			}
+			sio->write_offset += n;
+			done = 1;
 		}
 done:
 		cd_list_del(&msg->list);
@@ -317,6 +344,10 @@ done:
 
 	if (done)
 		sio_push(sio);
+exit:
+	/* free only if different than the initial automatic */
+	if (iov != iov_on_stack)
+		pcs_free(iov);
 }
 
 void pcs_sock_sendmsg(struct pcs_sockio * sio, struct pcs_msg *msg)
@@ -422,37 +453,6 @@ static unsigned int sio_get_retrans_stat(struct pcs_netio *netio)
 	}
 #endif
 	return retrans;
-}
-
-static void sio_trace_health(struct pcs_netio *netio, const char *role, unsigned long long id_val)
-{
-#ifdef HAVE_TCP_INFO
-	struct tcp_info info;
-	socklen_t ilen = sizeof(info);
-	int fd = netio->ioconn.fd;
-
-	if (getsockopt(fd, SOL_TCP, TCP_INFO, &info,  &ilen) == 0) {
-		unsigned int win, sndbuf, rcvbuf, outq;
-
-		ilen = sizeof(win);
-		getsockopt(fd, SOL_TCP, TCP_WINDOW_CLAMP, &win, &ilen);
-		ilen = sizeof(rcvbuf);
-		getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &ilen);
-		ilen = sizeof(sndbuf);
-		getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, &ilen);
-		ioctl(fd, TIOCOUTQ, &outq);
-
-		TRACE("Trouble on %s#%llu st=%u/%u bufs=%u/%u/%u/%u queue=%u/%u/%u/%u/%u retr=%u/%u/%u:%u rtt=%u/%u/%u cwnd=%u/%u/%u",
-		      role, id_val,
-		      info.tcpi_state, info.tcpi_ca_state,
-		      rcvbuf, win, sndbuf, outq,
-		      info.tcpi_unacked, info.tcpi_sacked, info.tcpi_lost, info.tcpi_retrans, info.tcpi_reordering,
-		      info.tcpi_total_retrans, info.tcpi_retransmits, info.tcpi_probes, info.tcpi_backoff,
-		      info.tcpi_rtt, info.tcpi_rttvar, info.tcpi_rcv_rtt,
-		      info.tcpi_snd_cwnd, info.tcpi_snd_ssthresh, info.tcpi_rcv_space
-		      );
-	}
-#endif
 }
 
 static int sio_getmyname(struct pcs_netio *netio, PCS_NET_ADDR_T * addr)
@@ -764,6 +764,138 @@ struct pcs_msg* bufqueue_as_pcs_output_msg(struct bufqueue *bq, u32 size)
 	bqmsg->last_offset = 0;
 
 	return msg;
+}
+
+#if defined(PCS_RUN_DEBUG_TOOLS) && defined(HAVE_TCP_INFO)
+static int ss_running;
+
+static int run_ss_co(struct pcs_coroutine *co, void *arg)
+{
+	int fd = (int)(ULONG_PTR)arg;
+
+	struct pcs_co_file *file;
+	if (!pcs_co_file_open("/proc/net/nf_conntrack", O_RDONLY, 0, &file)) {
+		pcs_co_file_to_log(LOG_ERR, "ct: ", file);
+		pcs_co_file_close(file);
+	}
+
+	struct sockaddr_in src, dst;
+	socklen_t ilen = sizeof(src);
+	if (getsockname(fd, &src, &ilen) || ilen != sizeof(src) || src.sin_family != AF_INET)
+		src.sin_port = 0;
+	ilen = sizeof(dst);
+	if (getpeername(fd, &dst, &ilen) || ilen != sizeof(dst) || dst.sin_family != AF_INET)
+		dst.sin_port = 0;
+
+	struct pcs_exec tcpdump_exec;
+	int tcpdump_started = -1;
+
+	if (src.sin_port) {
+		char tcpdump_out[64];
+		snprintf(tcpdump_out, sizeof(tcpdump_out), "/var/log/vstorage/tcpdump.%lu", pcs_thread_id());
+
+		char tcpdump_addr[16];
+		snprintf(tcpdump_addr, sizeof(tcpdump_addr), "%s", inet_ntoa(src.sin_addr));
+
+		char tcpdump_port[8];
+		snprintf(tcpdump_port, sizeof(tcpdump_port), "%u", ntohs(src.sin_port));
+
+		const char *tcpdump_cmd[] = {
+			"/usr/sbin/tcpdump", "-i", "any", "-nve", "-w", tcpdump_out, "-s", "1536",
+			"host", tcpdump_addr, "and",
+			"(", "arp", "or", "icmp", "or", "tcp", "port", tcpdump_port, ")", NULL
+		};
+
+		memset(&tcpdump_exec, 0, sizeof(tcpdump_exec));
+		tcpdump_exec.set_sigmask = 1;
+		sigemptyset(&tcpdump_exec.sigmask);
+		tcpdump_started = pcs_execute(tcpdump_cmd, &tcpdump_exec);
+	}
+
+	char ss_filter[64];
+	if (dst.sin_port && src.sin_port)
+		snprintf(ss_filter, sizeof(ss_filter), "sport = :%u and dport = :%u", ntohs(src.sin_port), ntohs(dst.sin_port));
+	else
+		snprintf(ss_filter, sizeof(ss_filter), "-p");
+	pcs_log(LOG_ERR, "ss: %s", ss_filter);
+
+	const char *ss_cmd[] = { "/usr/sbin/ss", "-atnoim", ss_filter, NULL };
+	struct pcs_exec ss_exec = {
+		.stdout_to_log = 1,
+		.stdout_log_prefix = "ss",
+		.stdout_log_level = LOG_ERR,
+		.wait_completion = 1,
+	};
+	pcs_execute(ss_cmd, &ss_exec);
+
+	const char *ip_cmd[] = { "/usr/sbin/ip", "neigh", "ls", "nud", "all", NULL };
+	struct pcs_exec ip_exec = {
+		.stdout_to_log = 1,
+		.stdout_log_prefix = "neigh",
+		.stdout_log_level = LOG_ERR,
+		.wait_completion = 1,
+	};
+	pcs_execute(ip_cmd, &ip_exec);
+
+	if (!tcpdump_started) {
+		int timeout = 120000;
+		pcs_co_wait_timeout(&timeout);
+		kill(tcpdump_exec.pid, SIGINT);
+		pcs_execute_wait(&tcpdump_exec);
+	}
+
+	pcs_sock_close(fd);
+	ss_running = 0;
+	return 0;
+}
+#endif /* PCS_RUN_DEBUG_TOOLS && HAVE_TCP_INFO */
+
+static void sio_trace_health(struct pcs_netio *netio, const char *role, unsigned long long id_val)
+{
+#ifdef HAVE_TCP_INFO
+	int fd = netio->ioconn.fd;
+
+	struct tcp_info info;
+	socklen_t ilen = sizeof(info);
+	if (getsockopt(fd, SOL_TCP, TCP_INFO, &info,  &ilen) != 0)
+		return;
+
+	unsigned int win = 0, sndbuf = 0, rcvbuf = 0, outq = 0;
+
+	ilen = sizeof(win);
+	getsockopt(fd, SOL_TCP, TCP_WINDOW_CLAMP, &win, &ilen);
+	ilen = sizeof(rcvbuf);
+	getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &ilen);
+	ilen = sizeof(sndbuf);
+	getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, &ilen);
+	ioctl(fd, TIOCOUTQ, &outq);
+
+	TRACE("Trouble on %s#%llu fd=%d st=%u/%u bufs=%u/%u/%u/%u queue=%u/%u/%u/%u/%u retr=%u/%u/%u:%u rtt=%u/%u/%u cwnd=%u/%u/%u",
+		role, id_val,
+		fd,
+		info.tcpi_state, info.tcpi_ca_state,
+		rcvbuf, win, sndbuf, outq,
+		info.tcpi_unacked, info.tcpi_sacked, info.tcpi_lost, info.tcpi_retrans, info.tcpi_reordering,
+		info.tcpi_total_retrans, info.tcpi_retransmits, info.tcpi_probes, info.tcpi_backoff,
+		info.tcpi_rtt, info.tcpi_rttvar, info.tcpi_rcv_rtt,
+		info.tcpi_snd_cwnd, info.tcpi_snd_ssthresh, info.tcpi_rcv_space
+	);
+
+#ifdef PCS_RUN_DEBUG_TOOLS
+	if (ss_running) {
+		TRACE("ss is already running");
+		return;
+	}
+
+	if ((fd = fcntl(fd, F_DUPFD_CLOEXEC, 0)) < 0) {
+		TRACE("dup failed");
+		return;
+	}
+
+	ss_running = 1;
+	pcs_co_create(NULL, run_ss_co, (void *)(ULONG_PTR)fd);
+#endif /* PCS_RUN_DEBUG_TOOLS */
+#endif /* HAVE_TCP_INFO */
 }
 
 /* netio transport operations */

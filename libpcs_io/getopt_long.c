@@ -1,7 +1,3 @@
-/*
- * Copyright © 2003-2018 Acronis International GmbH.
- */
-
 /*	$OpenBSD: getopt_long.c,v 1.20 2005/10/25 15:49:37 jmc Exp $	*/
 /*	$NetBSD: getopt_long.c,v 1.15 2002/01/31 22:43:40 tv Exp $	*/
 

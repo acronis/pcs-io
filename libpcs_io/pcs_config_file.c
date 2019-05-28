@@ -198,7 +198,7 @@ struct pcs_config *pcs_read_config(const char *fname)
 	if (!cfg)
 		return 0;
 
-	f = fopen(fname, "rt");
+	f = fopen(fname, "rte");
 	if (f) {
 		res = pcs_parse_config_file(cfg, f);
 		fclose(f);
@@ -253,7 +253,7 @@ int pcs_write_config(struct pcs_config *cfg, const char *fname)
 
 	if (!cfg || !fname)
 		return PCS_ERR_INV_PARAMS;
-	f = fopen(fname, "w");
+	f = fopen(fname, "we");
 	if (!f)
 		return PCS_ERR_IO;
 
@@ -272,12 +272,11 @@ char* pcs_write_config_mem(struct pcs_config *cfg)
 {
 	struct bufqueue bq;
 	bufqueue_init(&bq);
+	bq.prealloc_size = 1024;
 
 	struct pcs_config_node *n;
-	rb_for_each(struct pcs_config_node, n, &cfg->root, rb) {
-		char *line = pcs_xasprintf("%s=%s\n", n->key, n->value);
-		bufqueue_put(&bq, line, strlen(line));
-	}
+	rb_for_each(struct pcs_config_node, n, &cfg->root, rb)
+		bufqueue_printf(&bq, "%s=%s\n", n->key, n->value);
 
 	u32 len = bufqueue_get_size(&bq);
 	char *res = pcs_xmalloc(len + 1);
@@ -310,7 +309,7 @@ int pcs_config_getstr_expand(struct pcs_config *cfg, const char *key, const char
 
 	char *str = n->value;
 	const char *sep = "/\\.$()-+[];:<>?*\"'";
-	int expanded, i, e, len = strlen(str);
+	int expanded, i, e, len = (int)strlen(str);
 
 	do {
 		expanded = 0;
@@ -343,7 +342,7 @@ int pcs_config_getstr_expand(struct pcs_config *cfg, const char *key, const char
 			if (str != n->value)
 				pcs_free(str);
 			str = var;
-			len = strlen(str);
+			len = (int)strlen(str);
 
 			expanded = 1;
 			break;
@@ -373,13 +372,13 @@ int pcs_str_to_int(const char *str, void *buf, size_t size)
 	}
 
 	if (size == sizeof(s8))
-		(*(s8 *)buf) = val;
+		(*(s8 *)buf) = (s8)val;
 	else if (size == sizeof(s16))
-		(*(s16 *)buf) = val;
+		(*(s16 *)buf) = (s16)val;
 	else if (size == sizeof(s32))
-		(*(s32 *)buf) = val;
+		(*(s32 *)buf) = (s32)val;
 	else if (size == sizeof(s64))
-		(*(s64 *)buf) = val;
+		(*(s64 *)buf) = (s64)val;
 	else
 		BUG();
 
@@ -401,13 +400,13 @@ int pcs_str_to_uint(const char *str, void *buf, size_t size)
 		return -PCS_ERR_INVALID; /* overflow */
 
 	if (size == sizeof(u8))
-		(*(u8 *)buf) = val;
+		(*(u8 *)buf) = (u8)val;
 	else if (size == sizeof(u16))
-		(*(u16 *)buf) = val;
+		(*(u16 *)buf) = (u16)val;
 	else if (size == sizeof(u32))
-		(*(u32 *)buf) = val;
+		(*(u32 *)buf) = (u32)val;
 	else if (size == sizeof(u64))
-		(*(u64 *)buf) = val;
+		(*(u64 *)buf) = (u64)val;
 	else
 		BUG();
 

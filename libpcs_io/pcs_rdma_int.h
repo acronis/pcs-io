@@ -5,6 +5,8 @@
 #ifndef _PCS_RDMA_INT_H_
 #define _PCS_RDMA_INT_H_ 1
 
+#include <rdma/rdma_cma.h>
+
 /* Internals shared among pcs_rdma_*.[ch] */
 
 struct pcs_rdmaio *rio_create(struct pcs_process * proc, int hdr_size,
@@ -23,8 +25,8 @@ conn_param_init(struct rdma_conn_param *cp, struct pcs_rdmaio_conn_req *cr)
 	}
 
 	/* these two guys are about RDMA reads: see man rdma_connect(3) */
-	cp->responder_resources = RIO_QUEUE_DEPTH;
-	cp->initiator_depth     = RIO_QUEUE_DEPTH;
+	cp->responder_resources = RDMA_MAX_RESP_RES;
+	cp->initiator_depth     = RDMA_MAX_INIT_DEPTH;
 
 	cp->flow_control        = 1; /* does not matter */
 	cp->retry_count         = 5; /* # retransmissions when no ACK received */

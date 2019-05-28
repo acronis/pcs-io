@@ -100,7 +100,6 @@ int pcs_cpu_is_neon_supported()
 	return val & HWCAP_NEON;
 #else
 	BUG();
-	return 0;
 #endif
 }
 
@@ -114,7 +113,6 @@ int pcs_cpu_is_arm_crc_supported()
 	return val & HWCAP2_CRC32;
 #else
 	BUG();
-	return 0;
 #endif
 }
 
@@ -129,6 +127,5 @@ int pcs_cpu_is_arm_pmull_supported()
 	return val & HWCAP2_PMULL;
 #else
 	BUG();
-	return 0;
 #endif
 }

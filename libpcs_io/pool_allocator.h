@@ -72,10 +72,10 @@ struct mem_pool {
 };
 
 /* Initialize pool */
-void pool_init(struct mem_pool* p);
+PCS_API void pool_init(struct mem_pool* p);
 
 /* Initialize pool allocator, may return -1 if the size is not suitable for the pool allocation. */
-int pool_allocator_init(struct pool_allocator* a, unsigned size);
+PCS_API int pool_allocator_init(struct pool_allocator* a, unsigned size);
 
 /* Check if pool allocator was initialized successfully */
 static inline int pool_allocator_valid(struct pool_allocator* a)
@@ -84,7 +84,7 @@ static inline int pool_allocator_valid(struct pool_allocator* a)
 }
 
 /* Allocate chunk */
-void* pool_alloc(struct mem_pool* p, struct pool_allocator* a);
+PCS_API void* pool_alloc(struct mem_pool* p, struct pool_allocator* a);
 
 /* Release chunk */
-void pool_free(struct mem_pool* p, struct pool_allocator* a, void* ptr);
+PCS_API void pool_free(struct mem_pool* p, struct pool_allocator* a, void* ptr);

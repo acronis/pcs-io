@@ -15,6 +15,7 @@
 
 #include "log.h"
 #include "pcs_malloc.h"
+#include "pcs_sync_io.h"
 
 #define LIFETIME (60*60*24*365*50)  // 50 years, arbitrarily
 
@@ -103,6 +104,45 @@ char * pcs_pkey_to_pem(EVP_PKEY *key)
 	return buff;
 }
 
+static int read_pem_file(const char *path, char **res)
+{
+	int r;
+	pcs_fd_t fd = PCS_INVALID_FD;
+	struct pcs_stat stat;
+	char *buf = NULL;
+
+	if ((r = pcs_sync_open(path, O_RDONLY, 0, &fd))) {
+		r = -pcs_errno_to_err(-r);
+		goto out;
+	}
+	if ((r = pcs_sync_fstat(fd, &stat))) {
+		r = -pcs_errno_to_err(-r);
+		goto out;
+	}
+	buf = pcs_xmalloc(stat.size + 1);
+	r = pcs_sync_nread(fd, 0, buf, stat.size);
+	if (r < 0) {
+		r = -pcs_errno_to_err(-r);
+		goto out;
+	}
+	if (r < stat.size) {
+		pcs_log(LOG_ERR, "read('%s', 0, %llu) returned %i", path, (llu)stat.size, r);
+		r = -PCS_ERR_INVALID;
+		goto out;
+	}
+	buf[r] = '\0';
+	r = 0;
+out:
+	if (r < 0)
+		pcs_free(buf);
+	else
+		(*res) = buf;
+
+	if (fd != PCS_INVALID_FD)
+		pcs_sync_close(fd);
+	return r;
+}
+
 X509* pcs_cert_from_pem(const char *pem, int *out_sz)
 {
 	char *tmp;
@@ -119,16 +159,21 @@ X509* pcs_cert_from_pem(const char *pem, int *out_sz)
 	return c;
 }
 
-X509* pcs_cert_from_pem_file(const char *path)
+int pcs_cert_from_pem_file(const char *path, X509 **res)
 {
-	X509 *c = NULL;
+	int r;
 
-	BIO* bio = BIO_new_file(path, "r");
-	if (!bio)
-		return NULL;
-	c = PEM_read_bio_X509(bio, NULL, NULL, "\0");
-	BIO_free(bio);
-	return c;
+	char *pem = NULL;
+	if ((r = read_pem_file(path, &pem)))
+		return r;
+	int out_sz;
+	X509 *c = pcs_cert_from_pem(pem, &out_sz);
+	pcs_free(pem);
+
+	if (c == NULL)
+		return -PCS_ERR_INVALID;
+	(*res) = c;
+	return 0;
 }
 
 EVP_PKEY *pcs_pkey_from_pem(const char *pem, int *out_sz)
@@ -147,16 +192,21 @@ EVP_PKEY *pcs_pkey_from_pem(const char *pem, int *out_sz)
 	return key;
 }
 
-EVP_PKEY* pcs_pkey_from_pem_file(const char *path)
+int pcs_pkey_from_pem_file(const char *path, EVP_PKEY **res)
 {
-	EVP_PKEY *key = NULL;
+	int r;
 
-	BIO *bio = BIO_new_file(path, "r");
-	if (!bio)
-		return NULL;
-	key = PEM_read_bio_PrivateKey(bio, NULL, 0, (void *)__pkey_pass);
-	BIO_free(bio);
-	return key;
+	char *pem = NULL;
+	if ((r = read_pem_file(path, &pem)))
+		return r;
+	int out_sz;
+	EVP_PKEY *key = pcs_pkey_from_pem(pem, &out_sz);
+	pcs_free(pem);
+
+	if (key == NULL)
+		return -PCS_ERR_INVALID;
+	(*res) = key;
+	return 0;
 }
 
 X509_CRL* pcs_crl_from_pem(const char *pem, int *out_sz)
@@ -175,16 +225,21 @@ X509_CRL* pcs_crl_from_pem(const char *pem, int *out_sz)
 	return crl;
 }
 
-X509_CRL* pcs_crl_from_pem_file(const char *path)
+int pcs_crl_from_pem_file(const char *path, X509_CRL **res)
 {
-	X509_CRL *crl = NULL;
+	int r;
 
-	BIO *bio = BIO_new_file(path, "r");
-	if (!bio)
-		return NULL;
-	crl = PEM_read_bio_X509_CRL(bio, NULL, 0, NULL);
-	BIO_free(bio);
-	return crl;
+	char *pem = NULL;
+	if ((r = read_pem_file(path, &pem)))
+		return r;
+	int out_sz;
+	X509_CRL *crl = pcs_crl_from_pem(pem, &out_sz);
+	pcs_free(pem);
+
+	if (crl == NULL)
+		return -PCS_ERR_INVALID;
+	(*res) = crl;
+	return 0;
 }
 
 X509* pcs_create_cert(EVP_PKEY *key, const unsigned char *cn)

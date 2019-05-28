@@ -7,6 +7,7 @@
 
 #include "pcs_sock.h"
 #include "pcs_coroutine.h"
+#include "pcs_co_locks.h"
 
 /*
  * IO routines. Use them only on non-blocking files: pipes, sockets, but
@@ -35,6 +36,10 @@ struct pcs_co_file {
 	pthread_mutex_t		mutex;
 	int			mask;
 #endif /* __SUN__ */
+#ifdef __MAC__
+	struct pcs_co_mutex	wr_mutex;
+	u64			wr_offs;
+#endif /* __MAC__ */
 #endif /* __WINDOWS__ */
 };
 
@@ -46,12 +51,16 @@ static inline pcs_sock_t pcs_co_file_sock(struct pcs_co_file *file) { return (pc
 #define CO_IO_PARTIAL 1	/* sock/pipe: return partial buf if available, e.g. returned value can be < size even if not closed */
 #define CO_IO_NOWAIT  2	/* sock/pipe: don't wait for I/O, return what is available. Can return 0 bytes. */
 
+#define CO_IO_DATASYNC	1 /* do fdatasync() instead of fsync() */
+
 struct pcs_co_file_ops {
 	int (*read)(struct pcs_co_file *file, void *buf, int size, u64 offset, u32 flags);
 	int (*write)(struct pcs_co_file *file, const void * buf, int size, u64 offset, u32 flags);
 
 	int (*readv)(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u64 offset, u32 flags);
 	int (*writev)(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u64 offset, u32 flags);
+
+	int (*sync)(struct pcs_co_file *file, u32 flags);
 
 	int (*close)(struct pcs_co_file *file);
 };
@@ -74,6 +83,11 @@ PCS_API int pcs_co_file_close(struct pcs_co_file *file);
 
 PCS_API int pcs_co_file_pipe(struct pcs_co_file ** in_file, struct pcs_co_file ** out_file);
 
+#define PCS_CO_IN_PIPE_FOR_EXEC		1
+#define PCS_CO_OUT_PIPE_FOR_EXEC	2
+int pcs_co_file_pipe_ex(struct pcs_co_file ** in_file, struct pcs_co_file ** out_file, int pipe_for_exec);
+int pcs_co_open_dev_null(int flags, struct pcs_co_file ** file);
+
 /* --------------------------------------------------------------------------------- */
 
 /* Return number of bytes or -errno */
@@ -88,6 +102,8 @@ PCS_API int pcs_co_file_write_ex(struct pcs_co_file *file, const void * buf, int
 PCS_API int pcs_co_file_readv_ex(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u32 flags);
 PCS_API int pcs_co_file_writev_ex(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u32 flags);
 
+PCS_API int pcs_co_file_sync(struct pcs_co_file *file, u32 flags);
+
 /* --------------------------------------------------------------------------------- */
 
 /* Return 0 or -errno */
@@ -96,13 +112,15 @@ PCS_API int pcs_co_file_fallocate(pcs_fd_t fd, u64 size, u64 offset);
 PCS_API int pcs_co_file_make_sparse(pcs_fd_t fd);
 PCS_API int pcs_co_file_punch_hole(pcs_fd_t fd, u64 size, u64 offset);
 PCS_API int pcs_co_file_ftruncate(pcs_fd_t fd, u64 len);
-PCS_API int pcs_co_file_fsync(pcs_fd_t fd);
-PCS_API int pcs_co_file_fdatasync(pcs_fd_t fd);
 PCS_API int pcs_co_file_getfsize(pcs_fd_t fd, u64 * size);
 PCS_API int pcs_co_mkdir(const char * pathname, int mode);
+PCS_API int pcs_co_mkdirat(pcs_fd_t dirfd, const char * pathname, int mode);
 PCS_API int pcs_co_rmdir(const char * pathname);
+PCS_API int pcs_co_rmdirat(pcs_fd_t dirfd, const char * pathname);
 PCS_API int pcs_co_file_unlink(const char * pathname);
+PCS_API int pcs_co_file_unlinkat(pcs_fd_t dirfd, const char * pathname, int flags);
 PCS_API int pcs_co_file_rename(const char * oldpath, const char * newpath);
+PCS_API int pcs_co_file_renameat(pcs_fd_t olddirfd, const char * oldpath, pcs_fd_t newdirfd, const char * newpath);
 PCS_API int pcs_co_file_ioctl(pcs_fd_t fd, unsigned long int cmd, void *data);
 PCS_API int pcs_co_file_lock(pcs_fd_t fd, int cmd, short int type, u64 offs, u64 len);
 PCS_API int pcs_co_file_close_fd(pcs_fd_t fd);

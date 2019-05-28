@@ -32,8 +32,7 @@ struct pcs_watchdog
 	int		wd_run;
 
 	/* For pcs_evloop */
-	int		wd_poll_count;
-	int		wd_poll_checked;
+	u32		wd_poll_checked;
 	abs_time_t	wd_last_activity;
 	abs_time_t	wd_accounted;
 	abs_time_t	wd_inactive_total;
@@ -42,16 +41,12 @@ struct pcs_watchdog
 void pcs_watchdog_start(struct pcs_process *proc);
 void pcs_watchdog_stop(struct pcs_process *proc);
 void pcs_watchdog_init_evloop(struct pcs_evloop *evloop);
-void pcs_watchdog_enter_poll(struct pcs_evloop *evloop);
-void pcs_watchdog_leave_poll(struct pcs_evloop *evloop);
 
 #else /* PCS_USE_WATCHDOG */
 
 static inline void pcs_watchdog_start(struct pcs_process *proc) {}
 static inline void pcs_watchdog_stop(struct pcs_process *proc) {}
 static inline void pcs_watchdog_init_evloop(struct pcs_evloop *evloop) {}
-static inline void pcs_watchdog_enter_poll(struct pcs_evloop *evloop) {}
-static inline void pcs_watchdog_leave_poll(struct pcs_evloop *evloop) {}
 
 #endif /* PCS_USE_WATCHDOG */
 

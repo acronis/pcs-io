@@ -102,6 +102,73 @@ void pcs_ucontext_init(struct pcs_ucontext *context, void *stack, u32 stack_sz, 
 	context->sp = sp;
 }
 
+#elif defined(__LINUX__) && defined(__aarch64__)
+
+__asm__(".global pcs_ucontext_switch\n"
+	"pcs_ucontext_switch:\n\t"
+	"stp x19, x20, [sp, #-0xA0]!\n\t"
+	"stp x21, x22, [sp, #0x10]\n\t"
+	"stp x23, x24, [sp, #0x20]\n\t"
+	"stp x25, x26, [sp, #0x30]\n\t"
+	"stp x27, x28, [sp, #0x40]\n\t"
+	"stp x29, x30, [sp, #0x50]\n\t"
+	"stp d8,  d9,  [sp, #0x60]\n\t"
+	"stp d10, d11, [sp, #0x70]\n\t"
+	"stp d12, d13, [sp, #0x80]\n\t"
+	"stp d14, d15, [sp, #0x90]\n\t"
+	"mov x9, sp\n\t"
+	"str x9, [x0]\n\t"
+	"ldr x9, [x1]\n\t"
+	"mov sp, x9\n\t"
+	"ldp d14, d15, [sp, #0x90]\n\t"
+	"ldp d12, d13, [sp, #0x80]\n\t"
+	"ldp d10, d11, [sp, #0x70]\n\t"
+	"ldp d8,  d9,  [sp, #0x60]\n\t"
+	"ldp x29, x30, [sp, #0x50]\n\t"
+	"ldp x27, x28, [sp, #0x40]\n\t"
+	"ldp x25, x26, [sp, #0x30]\n\t"
+	"ldp x23, x24, [sp, #0x20]\n\t"
+	"ldp x21, x22, [sp, #0x10]\n\t"
+	"ldp x19, x20, [sp], #0xA0\n\t"
+	"ret");
+
+__asm__(".global pcs_ucontext_trampoline\n"
+	"pcs_ucontext_trampoline:\n\t"
+	".cfi_startproc\n\t"
+	".cfi_undefined x30\n\t"
+	"mov x0, x20\n\t"
+	"mov x30, #0\n\t"
+	"br x19\n\t"
+	".cfi_endproc");
+
+void pcs_ucontext_init(struct pcs_ucontext *context, void *stack, u32 stack_sz, void (*func)(void*), void *arg)
+{
+	void **sp = stack + stack_sz;
+	BUG_ON((ULONG_PTR)sp & 0xF);
+
+	*(--sp) = 0;					/* d15 */
+	*(--sp) = 0;					/* d14 */
+	*(--sp) = 0;					/* d13 */
+	*(--sp) = 0;					/* d12 */
+	*(--sp) = 0;					/* d11 */
+	*(--sp) = 0;					/* d10 */
+	*(--sp) = 0;					/* d9 */
+	*(--sp) = 0;					/* d8 */
+	*(--sp) = (void *)pcs_ucontext_trampoline;	/* x30 (LR) */
+	*(--sp) = 0;					/* x29 (FP) */
+	*(--sp) = 0;					/* x28 */
+	*(--sp) = 0;					/* x27 */
+	*(--sp) = 0;					/* x26 */
+	*(--sp) = 0;					/* x25 */
+	*(--sp) = 0;					/* x24 */
+	*(--sp) = 0;					/* x23 */
+	*(--sp) = 0;					/* x22 */
+	*(--sp) = 0;					/* x21 */
+	*(--sp) = arg;					/* x20 */
+	*(--sp) = (void *)func;				/* x19 */
+	context->sp = sp;
+}
+
 #elif defined(__WINDOWS__)
 
 void pcs_ucontext_switch(struct pcs_ucontext *save, struct pcs_ucontext *load)

@@ -118,7 +118,7 @@ static uint32_t crc32_32bit(uint32_t crc, const unsigned char *s, unsigned int l
 {
 	crc ^= 0xFFFFFFFF;
 
-	while (((unsigned long)s & 3) && len) {
+	while (((uintptr_t)s & 3) && len) {
 		crc = crc32_table[0][(unsigned char)(crc ^ (*s))] ^ (crc >> 8);
 		s++;
 		len--;

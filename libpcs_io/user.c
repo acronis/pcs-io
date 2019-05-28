@@ -105,6 +105,20 @@ int set_user_if_root(const char *user, const char *group)
 	} else
 		gid = pw->pw_gid;
 
+#if defined(__MAC__)
+	/* on mac, getgrouplist() takes int[], and setgroups() takes gid_t[] */
+	BUILD_BUG_ON(sizeof(int) != sizeof(gid_t));
+	#define GETGROUPLIST_GID_T int
+#else
+	#define GETGROUPLIST_GID_T gid_t
+#endif
+	gid_t groups[64];
+	int ngroups = sizeof(groups) / sizeof(groups[0]);
+	if (getgrouplist(user, gid, (GETGROUPLIST_GID_T *)groups, &ngroups) < 0) {
+		pcs_log(LOG_ERR, "getgrouplist failed: %s", strerror(errno));
+		return -1;
+	}
+
 	/* don't try to switch if we can't */
 	if (!is_root()) {
 		pcs_log(LOG_WARN, "Only root can switch users");
@@ -115,7 +129,7 @@ int set_user_if_root(const char *user, const char *group)
 	prctl(PR_SET_KEEPCAPS, 1);
 #endif
 
-	if (setgroups(1, &gid) < 0) {
+	if (setgroups(ngroups, groups) < 0) {
 		pcs_log(LOG_ERR, "setgroups failed: %s", strerror(errno));
 		return -1;
 	}
@@ -198,4 +212,3 @@ int set_user_if_root(const char *user, const char *group)
 }
 
 #endif
-

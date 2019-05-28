@@ -22,11 +22,12 @@
 #include <features.h>
 
 #define HAVE_FORK		1
-#define HAVE_AIO		1
 #define HAVE_POSIX_TIMER	1
 #define HAVE_OOM_ADJUST		1
 #define HAVE_PTHREAD_TIMEDJOIN	1
+#ifndef __aarch64__
 #define HAVE_TLS_STATIC		1
+#endif
 
 /* helpful link to find kernel/glibc version:
  * http://distrowatch.com/table.php?distribution=redhat */
@@ -39,6 +40,17 @@
 /* RHEL5 doesn't have eventfd in glibc */
 #if __GLIBC_PREREQ(2, 9)
   #define HAVE_EVENTFD	1
+  #define HAVE_PIPE2	1
+  #define HAVE_AIO	1	/* we need eventfd to use AIO */
+#endif
+
+#if __GLIBC_PREREQ(2, 10)
+  #define HAVE_ACCEPT4	1
+#endif
+
+#ifndef O_CLOEXEC
+/* It is safe to specify O_CLOEXEC always, older kernels ignore this flag */
+#define O_CLOEXEC	02000000
 #endif
 
 #endif	/* __LINUX__ */

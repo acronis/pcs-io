@@ -34,23 +34,6 @@ static size_t libunwind_backtrace(unw_cursor_t *cursor, void **array, size_t siz
 	} while (nr < size && unw_step(cursor) > 0);
 	return nr;
 }
-
-static void libunwind_init_cursor(unw_cursor_t *cursor, ucontext_t *context)
-{
-	if (!context) {
-		unw_context_t ctx;
-		unw_getcontext(&ctx);
-		unw_init_local(cursor, &ctx);
-	} else {
-#if defined(__LINUX__)
-		unw_init_local(cursor, (unw_context_t *)context);
-#elif defined(__MAC__)
-		unw_init_local(cursor, (unw_context_t *)&context->uc_mcontext->__ss);
-#else
-#error "How to convert ucontext_t into unw_context_t?"
-#endif
-	}
-}
 #endif
 
 #ifdef __linux__
@@ -92,38 +75,38 @@ static void libunwind_init_cursor(unw_cursor_t *cursor, ucontext_t *context)
  */
 
 #define HAVE_REGISTER_DUMP
-void register_dump(ucontext_t *ctx, void (*log_printf)(const char *fmt, ...))
+void register_dump(ucontext_t *ctx, log_printf_fn log_printf, void *arg)
 {
 	/* Generate the output. */
-	log_printf("Register dump:");
-	log_printf("");
-	log_printf(" RAX: %016llx   RBX: %016llx   RCX: %016llx", ctx->uc_mcontext.gregs[REG_RAX], ctx->uc_mcontext.gregs[REG_RBX], ctx->uc_mcontext.gregs[REG_RCX]);
-	log_printf(" RDX: %016llx   RSI: %016llx   RDI: %016llx", ctx->uc_mcontext.gregs[REG_RDX], ctx->uc_mcontext.gregs[REG_RSI], ctx->uc_mcontext.gregs[REG_RDI]);
-	log_printf(" RBP: %016llx   R8 : %016llx   R9 : %016llx", ctx->uc_mcontext.gregs[REG_RBP], ctx->uc_mcontext.gregs[REG_R8], ctx->uc_mcontext.gregs[REG_R9]);
-	log_printf(" R10: %016llx   R11: %016llx   R12: %016llx", ctx->uc_mcontext.gregs[REG_R10], ctx->uc_mcontext.gregs[REG_R11], ctx->uc_mcontext.gregs[REG_R12]);
-	log_printf(" R13: %016llx   R14: %016llx   R15: %016llx", ctx->uc_mcontext.gregs[REG_R13], ctx->uc_mcontext.gregs[REG_R14], ctx->uc_mcontext.gregs[REG_R15]);
-	log_printf(" RSP: %016llx", ctx->uc_mcontext.gregs[REG_RSP]);
-	log_printf("");
-	log_printf(" RIP: %016llx   EFLAGS: %08llx", ctx->uc_mcontext.gregs[REG_RIP], ctx->uc_mcontext.gregs[REG_EFL]);
-	log_printf("");
-	log_printf(" CS: %04x   FS: %04x   GS: %04x", ctx->uc_mcontext.gregs[REG_CSGSFS] & 0xffff, (ctx->uc_mcontext.gregs[REG_CSGSFS] >> 16) & 0xffff,
-		(ctx->uc_mcontext.gregs[REG_CSGSFS] >> 32) & 0xffff);
-	log_printf(" Trap: %08llx   Error: %08llx   OldMask: %08llx   CR2: %08llx",
-			ctx->uc_mcontext.gregs[REG_TRAPNO], ctx->uc_mcontext.gregs[REG_ERR], ctx->uc_mcontext.gregs[REG_OLDMASK], ctx->uc_mcontext.gregs[REG_CR2]);
-	log_printf("");
+	log_printf(arg, "Register dump:\n");
+	log_printf(arg, "\n");
+	log_printf(arg, " RAX: %016llx   RBX: %016llx   RCX: %016llx\n", (llu)ctx->uc_mcontext.gregs[REG_RAX], (llu)ctx->uc_mcontext.gregs[REG_RBX], (llu)ctx->uc_mcontext.gregs[REG_RCX]);
+	log_printf(arg, " RDX: %016llx   RSI: %016llx   RDI: %016llx\n", (llu)ctx->uc_mcontext.gregs[REG_RDX], (llu)ctx->uc_mcontext.gregs[REG_RSI], (llu)ctx->uc_mcontext.gregs[REG_RDI]);
+	log_printf(arg, " RBP: %016llx   R8 : %016llx   R9 : %016llx\n", (llu)ctx->uc_mcontext.gregs[REG_RBP], (llu)ctx->uc_mcontext.gregs[REG_R8], (llu)ctx->uc_mcontext.gregs[REG_R9]);
+	log_printf(arg, " R10: %016llx   R11: %016llx   R12: %016llx\n", (llu)ctx->uc_mcontext.gregs[REG_R10], (llu)ctx->uc_mcontext.gregs[REG_R11], (llu)ctx->uc_mcontext.gregs[REG_R12]);
+	log_printf(arg, " R13: %016llx   R14: %016llx   R15: %016llx\n", (llu)ctx->uc_mcontext.gregs[REG_R13], (llu)ctx->uc_mcontext.gregs[REG_R14], (llu)ctx->uc_mcontext.gregs[REG_R15]);
+	log_printf(arg, " RSP: %016llx\n", (llu)ctx->uc_mcontext.gregs[REG_RSP]);
+	log_printf(arg, "\n");
+	log_printf(arg, " RIP: %016llx   EFLAGS: %08llx\n", (llu)ctx->uc_mcontext.gregs[REG_RIP], (llu)ctx->uc_mcontext.gregs[REG_EFL]);
+	log_printf(arg, "\n");
+	log_printf(arg, " CS: %04x   FS: %04x   GS: %04x\n", (unsigned)(ctx->uc_mcontext.gregs[REG_CSGSFS] & 0xffff),
+		(unsigned)((ctx->uc_mcontext.gregs[REG_CSGSFS] >> 16) & 0xffff), (unsigned)((ctx->uc_mcontext.gregs[REG_CSGSFS] >> 32) & 0xffff));
+	log_printf(arg, " Trap: %08llx   Error: %08llx   OldMask: %08llx   CR2: %08llx\n",
+			(llu)ctx->uc_mcontext.gregs[REG_TRAPNO], (llu)ctx->uc_mcontext.gregs[REG_ERR], (llu)ctx->uc_mcontext.gregs[REG_OLDMASK], (llu)ctx->uc_mcontext.gregs[REG_CR2]);
+	log_printf(arg, "\n");
 
 	if (ctx->uc_mcontext.fpregs != NULL) {
 		int i;
 
 		/* Generate output for the FPU control/status registers. */
-		log_printf(" FPUCW: %08x   FPUSW: %08x   TAG: %08x",
+		log_printf(arg, " FPUCW: %08x   FPUSW: %08x   TAG: %08x\n",
 				ctx->uc_mcontext.fpregs->cwd, ctx->uc_mcontext.fpregs->swd, ctx->uc_mcontext.fpregs->ftw);
-		log_printf(" RIP: %08llx   RDP: %08llx", ctx->uc_mcontext.fpregs->rip, ctx->uc_mcontext.fpregs->rdp);
-		log_printf("");
+		log_printf(arg, " RIP: %08llx   RDP: %08llx\n", (llu)ctx->uc_mcontext.fpregs->rip, (llu)ctx->uc_mcontext.fpregs->rdp);
+		log_printf(arg, "\n");
 
 		/* Now the real FPU registers. */
 		for (i = 0; i < 8; i += 2) {
-			log_printf(" ST(%d) %04x %04x%04x%04x%04x    ST(%d) %04x %04x%04x%04x%04x", i,
+			log_printf(arg, " ST(%d) %04x %04x%04x%04x%04x    ST(%d) %04x %04x%04x%04x%04x\n", i,
 					ctx->uc_mcontext.fpregs->_st[i].exponent,
 					ctx->uc_mcontext.fpregs->_st[i].significand[3],
 					ctx->uc_mcontext.fpregs->_st[i].significand[2],
@@ -136,11 +119,11 @@ void register_dump(ucontext_t *ctx, void (*log_printf)(const char *fmt, ...))
 					ctx->uc_mcontext.fpregs->_st[i+1].significand[1],
 					ctx->uc_mcontext.fpregs->_st[i+1].significand[0]);
 		}
-		log_printf("");
+		log_printf(arg, "\n");
 
-		log_printf(" mxcsr: %04x", ctx->uc_mcontext.fpregs->mxcsr);
+		log_printf(arg, " mxcsr: %04x\n", ctx->uc_mcontext.fpregs->mxcsr);
 		for (i = 0; i < 16; i += 2) {
-			log_printf(" XMM%-2d: %08x%08x%08x%08x   XMM%-2d: %08x%08x%08x%08x", i,
+			log_printf(arg, " XMM%-2d: %08x%08x%08x%08x   XMM%-2d: %08x%08x%08x%08x\n", i,
 					ctx->uc_mcontext.fpregs->_xmm[i].element[3],
 					ctx->uc_mcontext.fpregs->_xmm[i].element[2],
 					ctx->uc_mcontext.fpregs->_xmm[i].element[1],
@@ -151,7 +134,7 @@ void register_dump(ucontext_t *ctx, void (*log_printf)(const char *fmt, ...))
 					ctx->uc_mcontext.fpregs->_xmm[i+1].element[1],
 					ctx->uc_mcontext.fpregs->_xmm[i+1].element[0]);
 		}
-		log_printf("");
+		log_printf(arg, "\n");
 	}
 
 }
@@ -161,74 +144,74 @@ void register_dump(ucontext_t *ctx, void (*log_printf)(const char *fmt, ...))
 /* --------------------------------------------------------------------------------------------- */
 
 #ifdef _WIN64
-void register_dump(ucontext_t *ctx, void (*log_printf)(const char *fmt, ...))
+void register_dump(ucontext_t *ctx, log_printf_fn log_printf, void *arg)
 {
 	int i;
 
 	/* Generate the output. */
-	log_printf("Register dump:");
-	log_printf("");
-	log_printf(" RAX: %016x   RBX: %016x   RCX: %016x", ctx->ContextRecord->Rax, ctx->ContextRecord->Rbx, ctx->ContextRecord->Rcx);
-	log_printf(" RDX: %016x   RSI: %016x   RDI: %016x", ctx->ContextRecord->Rdx, ctx->ContextRecord->Rsi, ctx->ContextRecord->Rdi);
-	log_printf(" RBP: %016x   R8 : %016x   R9 : %016x", ctx->ContextRecord->Rbp, ctx->ContextRecord->R8,  ctx->ContextRecord->R9);
-	log_printf(" R10: %016x   R11: %016x   R12: %016x", ctx->ContextRecord->R10, ctx->ContextRecord->R11, ctx->ContextRecord->R12);
-	log_printf(" R13: %016x   R14: %016x   R15: %016x", ctx->ContextRecord->R13, ctx->ContextRecord->R14, ctx->ContextRecord->R15);
-	log_printf(" RSP: %016x", ctx->ContextRecord->Rsp);
-	log_printf("");
-	log_printf(" RIP: %016x   EFLAGS: %08x", ctx->ContextRecord->Rip, ctx->ContextRecord->EFlags);
-	log_printf(" CS: %04x   FS: %04x   GS: %04x", ctx->ContextRecord->SegCs, ctx->ContextRecord->SegFs, ctx->ContextRecord->SegGs);
-	log_printf("");
-	log_printf(" Addr: %016x   Code: %08x   Flags: %08x",
+	log_printf(arg, "Register dump:\n");
+	log_printf(arg, "\n");
+	log_printf(arg, " RAX: %016x   RBX: %016x   RCX: %016x\n", ctx->ContextRecord->Rax, ctx->ContextRecord->Rbx, ctx->ContextRecord->Rcx);
+	log_printf(arg, " RDX: %016x   RSI: %016x   RDI: %016x\n", ctx->ContextRecord->Rdx, ctx->ContextRecord->Rsi, ctx->ContextRecord->Rdi);
+	log_printf(arg, " RBP: %016x   R8 : %016x   R9 : %016x\n", ctx->ContextRecord->Rbp, ctx->ContextRecord->R8,  ctx->ContextRecord->R9);
+	log_printf(arg, " R10: %016x   R11: %016x   R12: %016x\n", ctx->ContextRecord->R10, ctx->ContextRecord->R11, ctx->ContextRecord->R12);
+	log_printf(arg, " R13: %016x   R14: %016x   R15: %016x\n", ctx->ContextRecord->R13, ctx->ContextRecord->R14, ctx->ContextRecord->R15);
+	log_printf(arg, " RSP: %016x\n", ctx->ContextRecord->Rsp);
+	log_printf(arg, "\n");
+	log_printf(arg, " RIP: %016x   EFLAGS: %08x\n", ctx->ContextRecord->Rip, ctx->ContextRecord->EFlags);
+	log_printf(arg, " CS: %04x   FS: %04x   GS: %04x\n", ctx->ContextRecord->SegCs, ctx->ContextRecord->SegFs, ctx->ContextRecord->SegGs);
+	log_printf(arg, "\n");
+	log_printf(arg, " Addr: %016x   Code: %08x   Flags: %08x\n",
 			ctx->ExceptionRecord->ExceptionAddress, ctx->ExceptionRecord->ExceptionCode, ctx->ExceptionRecord->ExceptionFlags);
-	log_printf("");
+	log_printf(arg, "\n");
 
 	/* Generate output for the FPU control/status registers. */
-	log_printf(" FPUCW: %04x   FPUSW: %08x   TAG: %08x",
+	log_printf(arg, " FPUCW: %04x   FPUSW: %08x   TAG: %08x\n",
 			ctx->ContextRecord->FltSave.ControlWord, ctx->ContextRecord->FltSave.StatusWord, ctx->ContextRecord->FltSave.TagWord);
-	log_printf(" RIP: %08x   RDP: %08x", ctx->ContextRecord->FltSave.ErrorOffset, ctx->ContextRecord->FltSave.DataOffset);
-	log_printf("");
+	log_printf(arg, " RIP: %08x   RDP: %08x\n", ctx->ContextRecord->FltSave.ErrorOffset, ctx->ContextRecord->FltSave.DataOffset);
+	log_printf(arg, "\n");
 
 	/* Now the real FPU registers. */
 	for (i = 0; i < 8; i += 2) {
-		log_printf(" ST(%d) %08x%08x     ST(%d) %08x%08x", i,
+		log_printf(arg, " ST(%d) %08x%08x     ST(%d) %08x%08x\n", i,
 			ctx->ContextRecord->FltSave.FloatRegisters[i].High,
 			ctx->ContextRecord->FltSave.FloatRegisters[i].Low,
 			i+1,
 			ctx->ContextRecord->FltSave.FloatRegisters[i+1].High,
 			ctx->ContextRecord->FltSave.FloatRegisters[i+1].Low);
 	}
-	log_printf("");
+	log_printf(arg, "\n");
 
-	log_printf(" mxcsr: %04x", ctx->ContextRecord->FltSave.MxCsr);
+	log_printf(arg, " mxcsr: %04x\n", ctx->ContextRecord->FltSave.MxCsr);
 	for (i = 0; i < 16; i += 2) {
-		log_printf(" XMM%-2d: %016x%016x   XMM%-2d: %016x%016x", i,
+		log_printf(arg, " XMM%-2d: %016x%016x   XMM%-2d: %016x%016x\n", i,
 				ctx->ContextRecord->FltSave.XmmRegisters[i].High,
 				ctx->ContextRecord->FltSave.XmmRegisters[i].Low,
 				i+1,
 				ctx->ContextRecord->FltSave.XmmRegisters[i+1].High,
 				ctx->ContextRecord->FltSave.XmmRegisters[i+1].Low);
 	}
-	log_printf("");
+	log_printf(arg, "\n");
 }
 #elif defined(_WIN32)
-void register_dump(ucontext_t *ctx, void (*log_printf)(const char *fmt, ...))
+void register_dump(ucontext_t *ctx, log_printf_fn log_printf, void *arg)
 {
 	/* Generate the output. */
-	log_printf("Register dump:");
-	log_printf("");
-	log_printf(" EAX: %08x   EBX: %08x   ECX: %08x", ctx->ContextRecord->Eax, ctx->ContextRecord->Ebx, ctx->ContextRecord->Ecx);
-	log_printf(" EDX: %08x   ESI: %08x   EDI: %08x", ctx->ContextRecord->Edx, ctx->ContextRecord->Esi, ctx->ContextRecord->Edi);
-	log_printf(" EBP: %08x   ESP: %08x", ctx->ContextRecord->Ebp, ctx->ContextRecord->Esp);
-	log_printf("");
+	log_printf(arg, "Register dump:\n");
+	log_printf(arg, "\n");
+	log_printf(arg, " EAX: %08x   EBX: %08x   ECX: %08x\n", ctx->ContextRecord->Eax, ctx->ContextRecord->Ebx, ctx->ContextRecord->Ecx);
+	log_printf(arg, " EDX: %08x   ESI: %08x   EDI: %08x\n", ctx->ContextRecord->Edx, ctx->ContextRecord->Esi, ctx->ContextRecord->Edi);
+	log_printf(arg, " EBP: %08x   ESP: %08x\n", ctx->ContextRecord->Ebp, ctx->ContextRecord->Esp);
+	log_printf(arg, "\n");
 
-	log_printf(" EIP: %08x   EFLAGS: %08x", ctx->ContextRecord->Eip, ctx->ContextRecord->EFlags);
-	log_printf("");
+	log_printf(arg, " EIP: %08x   EFLAGS: %08x\n", ctx->ContextRecord->Eip, ctx->ContextRecord->EFlags);
+	log_printf(arg, "\n");
 
-	log_printf(" CS: %04x   FS: %04x   GS: %04x", ctx->ContextRecord->SegCs, ctx->ContextRecord->SegFs, ctx->ContextRecord->SegGs);
-	log_printf("");
+	log_printf(arg, " CS: %04x   FS: %04x   GS: %04x\n", ctx->ContextRecord->SegCs, ctx->ContextRecord->SegFs, ctx->ContextRecord->SegGs);
+	log_printf(arg, "\n");
 
-	log_printf(" Addr: %08x   Code: %08x   Flags: %08x", ctx->ExceptionRecord->ExceptionAddress, ctx->ExceptionRecord->ExceptionCode, ctx->ExceptionRecord->ExceptionFlags);
-	log_printf("");
+	log_printf(arg, " Addr: %08x   Code: %08x   Flags: %08x\n", ctx->ExceptionRecord->ExceptionAddress, ctx->ExceptionRecord->ExceptionCode, ctx->ExceptionRecord->ExceptionFlags);
+	log_printf(arg, "\n");
 }
 #endif /* _WIN32 */
 
@@ -351,7 +334,7 @@ static char * create_search_path(size_t path_sz)
 	return search_path;
 }
 
-static int sym_init(void (*log_printf)(const char *fmt, ...))
+static int sym_init(log_printf_fn log_printf, void *arg)
 {
 	static int initialized = 0;
 	if (initialized)
@@ -368,7 +351,7 @@ static int sym_init(void (*log_printf)(const char *fmt, ...))
 #define GET_ADDRESS(func) \
 	p ## func = (t ## func) GetProcAddress(g_dbghelp, #func);	\
 	if (!(p ## func)) {						\
-		log_printf("sym_init: unable to find %s", #func);	\
+		log_printf(arg, "sym_init: unable to find %s\n", #func); \
 		goto fail;						\
 	}								\
 
@@ -378,7 +361,7 @@ static int sym_init(void (*log_printf)(const char *fmt, ...))
 	search_path = create_search_path(SEARCH_PATH_MAX);
 
 	if (!pSymInitialize(GetCurrentProcess(), search_path, TRUE)) {
-		log_printf("sym_init: SymInitialize failed: %d", GetLastError());
+		log_printf(arg, "sym_init: SymInitialize failed: %d\n", GetLastError());
 		goto fail;
 	}
 
@@ -419,10 +402,10 @@ static void addr2name(HANDLE proc, DWORD64 addr, char *name, int len)
 	}
 }
 
-static void trace_dump_ctx(CONTEXT *ctx, void (*log_printf)(const char *fmt, ...))
+static void trace_dump_ctx(CONTEXT *ctx, log_printf_fn log_printf, void *arg)
 {
-	if (sym_init(log_printf)) {
-		log_printf("sym_init() failed");
+	if (sym_init(log_printf, arg)) {
+		log_printf(arg, "sym_init() failed\n");
 		return;
 	}
 
@@ -452,7 +435,7 @@ static void trace_dump_ctx(CONTEXT *ctx, void (*log_printf)(const char *fmt, ...
 
 		static char name[MAX_SYM_NAME];
 		addr2name(proc, addr, name, sizeof(name));
-		log_printf("%2d: %s(%s) [0x%llx]", frame_nr, module.ModuleName, name, addr);
+		log_printf(arg, "%2d: %s(%s) [0x%llx]\n", frame_nr, module.ModuleName, name, addr);
 
 		if (stackframe.AddrReturn.Offset == 0) {
 			SetLastError(0);
@@ -462,11 +445,11 @@ static void trace_dump_ctx(CONTEXT *ctx, void (*log_printf)(const char *fmt, ...
 
 	int err = GetLastError();
 	if (err)
-		log_printf("StackWalk64 failed with error %d", err);
-	log_printf("");
+		log_printf(arg, "StackWalk64 failed with error %d\n", err);
+	log_printf(arg, "\n");
 }
 
-void trace_dump(ucontext_t *uctx, void (*log_printf)(const char *fmt, ...))
+void trace_dump(ucontext_t *uctx, log_printf_fn log_printf, void *arg)
 {
 	CONTEXT ctx;
 
@@ -486,48 +469,60 @@ current_eip:		mov [ctx.Ebp], ebp
 #endif
 	}
 
-	trace_dump_ctx(&ctx, log_printf);
+	trace_dump_ctx(&ctx, log_printf, arg);
 }
 #else /* !__WINDOWS__ */
 #if defined(__LINUX__) || defined(__MAC__)
-static void symbols_dump(void **array, size_t size, void (*log_printf)(const char *fmt, ...))
+static void symbols_dump(void **array, size_t size, log_printf_fn log_printf, void *arg)
 {
 	char **strings = backtrace_symbols(array, size);
 
-	log_printf("---------- [%zd stack frames] ----------", size);
+	log_printf(arg, "---------- [%zd stack frames] ----------\n", size);
 
 	size_t i;
 	for (i = 0; i < size; i++)
-		log_printf("%s", strings[i]);
+		log_printf(arg, "%s\n", strings[i]);
 
 	pcs_native_free(strings);
-	log_printf("");
+	log_printf(arg, "\n");
 }
 #endif /* __LINUX__ || __MAC__ */
 
-void trace_dump(ucontext_t *context, void (*log_printf)(const char *fmt, ...))
+void trace_dump(ucontext_t *context, log_printf_fn log_printf, void *arg)
 {
 #if defined(__LINUX__) || defined(__MAC__)
 	void *array[128];
 #ifdef HAVE_LIBUNWIND
 	unw_cursor_t cursor;
-	libunwind_init_cursor(&cursor, context);
+	if (!context) {
+		unw_context_t ctx;
+		unw_getcontext(&ctx);
+		unw_init_local(&cursor, &ctx);
+	} else {
+#if defined(__LINUX__)
+		unw_init_local(&cursor, (unw_context_t *)context);
+#elif defined(__MAC__)
+		unw_init_local(&cursor, (unw_context_t *)&context->uc_mcontext->__ss);
+#else
+#error "How to convert ucontext_t into unw_context_t?"
+#endif
+	}
 	size_t size = libunwind_backtrace(&cursor, array, sizeof(array) / sizeof(array[0]));
 #else
 	size_t size = backtrace(array, sizeof(array) / sizeof(array[0]));
 #endif
-	symbols_dump(array, size, log_printf);
+	symbols_dump(array, size, log_printf, arg);
 #endif /* __LINUX__ || __MAC__ */
 }
 
 #ifndef HAVE_REGISTER_DUMP
-void register_dump(ucontext_t *ctx, void (*log_printf)(const char *fmt, ...))
+void register_dump(ucontext_t *ctx, log_printf_fn log_printf, void *arg)
 {
 }
 #endif
 #endif /* !__WINDOWS__ */
 
-void trace_dump_coroutine(struct pcs_ucontext *context, void (*log_printf)(const char *fmt, ...))
+void trace_dump_coroutine(struct pcs_ucontext *context, log_printf_fn log_printf, void *arg)
 {
 #if defined(HAVE_LIBUNWIND) && (defined(__LINUX__) || defined(__MAC__)) && defined(__x86_64__)
 	unw_context_t ctx;
@@ -548,7 +543,7 @@ void trace_dump_coroutine(struct pcs_ucontext *context, void (*log_printf)(const
 
 	void *array[128];
 	size_t size = libunwind_backtrace(&cursor, array, sizeof(array) / sizeof(array[0]));
-	symbols_dump(array, size, log_printf);
+	symbols_dump(array, size, log_printf, arg);
 #elif defined(HAVE_LIBUNWIND) && defined(__LINUX__) && defined(__i386__)
 	unw_context_t ctx;
 	unw_getcontext(&ctx);
@@ -566,7 +561,42 @@ void trace_dump_coroutine(struct pcs_ucontext *context, void (*log_printf)(const
 
 	void *array[128];
 	size_t size = libunwind_backtrace(&cursor, array, sizeof(array) / sizeof(array[0]));
-	symbols_dump(array, size, log_printf);
+	symbols_dump(array, size, log_printf, arg);
+#elif defined(HAVE_LIBUNWIND) && defined(__LINUX__) && defined(__aarch64__)
+	unw_context_t ctx;
+	unw_getcontext(&ctx);
+	unw_cursor_t cursor;
+	unw_init_local(&cursor, &ctx);
+
+	/* order should match to pcs_ucontext.c */
+	void **sp = context->sp;
+	unw_set_reg(&cursor, UNW_REG_SP, (unw_word_t)sp);
+	unw_set_reg(&cursor, UNW_AARCH64_X19, (unw_word_t)*(sp++));
+	unw_set_reg(&cursor, UNW_AARCH64_X20, (unw_word_t)*(sp++));
+	unw_set_reg(&cursor, UNW_AARCH64_X21, (unw_word_t)*(sp++));
+	unw_set_reg(&cursor, UNW_AARCH64_X22, (unw_word_t)*(sp++));
+	unw_set_reg(&cursor, UNW_AARCH64_X23, (unw_word_t)*(sp++));
+	unw_set_reg(&cursor, UNW_AARCH64_X24, (unw_word_t)*(sp++));
+	unw_set_reg(&cursor, UNW_AARCH64_X25, (unw_word_t)*(sp++));
+	unw_set_reg(&cursor, UNW_AARCH64_X26, (unw_word_t)*(sp++));
+	unw_set_reg(&cursor, UNW_AARCH64_X27, (unw_word_t)*(sp++));
+	unw_set_reg(&cursor, UNW_AARCH64_X28, (unw_word_t)*(sp++));
+	unw_set_reg(&cursor, UNW_AARCH64_X29, (unw_word_t)sp);
+	sp += 2;
+	unw_set_reg(&cursor, UNW_AARCH64_V8,  (unw_word_t)*(sp++));
+	unw_set_reg(&cursor, UNW_AARCH64_V9,  (unw_word_t)*(sp++));
+	unw_set_reg(&cursor, UNW_AARCH64_V10, (unw_word_t)*(sp++));
+	unw_set_reg(&cursor, UNW_AARCH64_V11, (unw_word_t)*(sp++));
+	unw_set_reg(&cursor, UNW_AARCH64_V12, (unw_word_t)*(sp++));
+	unw_set_reg(&cursor, UNW_AARCH64_V13, (unw_word_t)*(sp++));
+	unw_set_reg(&cursor, UNW_AARCH64_V14, (unw_word_t)*(sp++));
+	unw_set_reg(&cursor, UNW_AARCH64_V15, (unw_word_t)*(sp++));
+
+	void *array[128];
+	size_t size = 0;
+	if (unw_step(&cursor) > 0)
+		size = libunwind_backtrace(&cursor, array, sizeof(array) / sizeof(array[0]));
+	symbols_dump(array, size, log_printf, arg);
 #elif defined(__WINDOWS__)
 #ifdef _WIN64
 	CONTEXT ctx = *(CONTEXT *)((u8 *)context->fiber + 0x30);
@@ -576,6 +606,6 @@ void trace_dump_coroutine(struct pcs_ucontext *context, void (*log_printf)(const
 	ctx.Eip = *(DWORD*)ctx.Esp;
 	ctx.Esp += 8;
 #endif
-	trace_dump_ctx(&ctx, log_printf);
+	trace_dump_ctx(&ctx, log_printf, arg);
 #endif
 }

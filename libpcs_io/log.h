@@ -45,8 +45,6 @@
 #define LOG_LEVEL_SRV_DEFAULT LOG_TRACE
 
 #define LOG_LEVEL_MASK	0x0FF
-#define LOG_NONL	0x100	/* no default \n at the end */
-#define LOG_NOIND	0x200	/* no indentation */
 #define LOG_NOTS	0x400	/* no timestamp */
 #define LOG_STDOUT	(0x800 | LOG_NOTS)	/* trace to stdout */
 
@@ -59,9 +57,6 @@ PCS_API int *pcs_log_lvl(void);
 PCS_API extern int __pcs_log_level;
 #define pcs_log_level __pcs_log_level
 #endif
-
-PCS_API int *pcs_log_indent(void);
-#define log_indent (*pcs_log_indent())
 
 /* Returns true if pcs_log_level is not enough to print messages with a given verbosity level */
 static inline int pcs_log_quiet(int level)
@@ -76,7 +71,10 @@ static inline int pcs_log_quiet(int level)
 /* Log message formatting routines */
 PCS_API void pcs_log(int level, const char *fmt, ...) __printf(2, 3);
 PCS_API void pcs_valog(int level, const char *prefix, const char *fmt, va_list va);
-PCS_API void pcs_log_hexdump(int level, const void *buf, int len);
+PCS_API void pcs_log_hexdump(int level, const void *buf, int len, const char *prefix_fmt, ...) __printf(4, 5);
+
+struct bufqueue;
+PCS_API void pcs_log_bufqueue(int level, struct bufqueue *bq);
 
 PCS_API void pcs_trace(int level, const char* func, const char *fmt, ...) __printf(3, 4);
 
@@ -87,6 +85,12 @@ PCS_API void show_trace(void);
 
 struct pcs_ucontext;
 void show_trace_coroutine(struct pcs_ucontext *ctx);
+
+/* Set the number of log buffers to allocate.
+ * Should be called before actual log creation (pcs_set_logfile)
+ * otherwise it wont have any effect.
+ */
+PCS_API void pcs_log_set_buffer_count(unsigned nbuffers);
 
 /* Register product version to print on traces */
 PCS_API void pcs_log_version_register(const char *version);
@@ -104,13 +108,13 @@ int __pcs_log_format_time_std(abs_time_t ts, char* buff, unsigned sz, char *save
  * This function may be called only once. It is expected to be called at the application startup.
  * Only one of two functions: pcs_set_logfile[_ex]() or pcs_set_log_handler() must be called.
  *
- * prefix: file name prefix (includes directory). See comments in pcs_log_rotate_t for
- *   filename formats.
- * compression: "gz", "zst" or "" (empty string)
+ * dir: output directory for log files
+ * prefix: file name prefix. See comments in pcs_log_rotate_t for filename formats.
+ * compression: "gz", "zst" or NULL|"" for uncompressed logs
  * rotate_mode: PCS_LOG_ROTATE_ENUM or PCS_LOG_ROTATE_MULTIPROC
  * id: include this numeric id to filename. If 0 - use PID, if > 0 - use
  * this id (PCS_LOG_ROTATE_MULTIPROC mode only) */
-PCS_API int pcs_set_logfile_ex(const char *prefix, const char *compression, int flags);
+PCS_API int pcs_set_logfile_ex(const char *dir, const char *prefix, const char *compression, int flags);
 
 /* pcs_set_logfile_ex with PCS_LOG_TS_STD timestamps format */
 PCS_API int pcs_set_logfile(const char * path);
@@ -128,7 +132,7 @@ extern const char *log_exts[];
  * This function may be called only once. It is expected to be called at the application startup.
  * Only one of two functions: pcs_set_logfile() or pcs_set_log_handler() must be called.
  * The log rotation is disabled in case log handler is set. */
-PCS_API void pcs_set_log_handler(void (*handler)(int level, int indent, const char *prefix, const char *fmt, va_list va));
+PCS_API void pcs_set_log_handler(void (*handler)(int level, const char *buf, unsigned int len));
 
 /* Write buffered data data to disk and terminate writer thread. */
 PCS_API void pcs_log_terminate(void);
@@ -175,9 +179,9 @@ void pcs_log_exitmsg(const char *fmt, ...) __printf(1,2);
 
 #define TRACE_(l, ...)	pcs_trace((l), __FUNCTION__, __VA_ARGS__)
 
-#define TRACE0()        TRACE_(LOG_TRACE, NULL)
+#define TRACE0()        TRACE_(LOG_TRACE, "\n")
 #define TRACE(...)  TRACE_(LOG_TRACE, __VA_ARGS__)
-#define DTRACE0()       TRACE_(LOG_DTRACE, NULL)
+#define DTRACE0()       TRACE_(LOG_DTRACE, "\n")
 #define DTRACE(...) TRACE_(LOG_DTRACE, __VA_ARGS__)
 
 #define TRACE_ACTIVE_(l) (pcs_log_level >= (l))

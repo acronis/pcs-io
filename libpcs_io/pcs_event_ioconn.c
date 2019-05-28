@@ -49,14 +49,13 @@ int pcs_event_ioconn_init(struct pcs_process *proc, struct pcs_event_ioconn **ev
 	conn->data_ready = event_data_ready;
 
 #if defined(HAVE_EVENTFD)
-	int fd = eventfd(0, 0);
+	int fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 	if (fd < 0) {
 		int err = -errno;
 		pcs_free(event);
 		return err;
 	}
 
-	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
 	conn->fd = event->send_event_fd = fd;
 	pcs_ioconn_register(conn);
 #elif defined(HAVE_KQUEUE)
@@ -76,6 +75,8 @@ int pcs_event_ioconn_init(struct pcs_process *proc, struct pcs_event_ioconn **ev
 		return err;
 	}
 
+	fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+	fcntl(fds[0], F_SETFD, FD_CLOEXEC);
 	fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL, 0) | O_NONBLOCK);
 	fcntl(fds[1], F_SETFL, fcntl(fds[1], F_GETFL, 0) | O_NONBLOCK);
 	conn->fd = fds[0];

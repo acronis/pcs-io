@@ -15,6 +15,7 @@
 #include "pcs_co_locks.h"
 #include "pcs_co_io.h"
 #include "pcs_context.h"
+#include "pcs_event_ioconn.h"
 #include "pcs_malloc.h"
 #include "pcs_file_job.h"
 #include "pcs_cpuid.h"
@@ -38,56 +39,204 @@
 #include <sanitizer/lsan_interface.h>
 #endif
 #ifdef PCS_THREAD_SANIT
-void *__tsan_co_current(void);
-void *__tsan_co_create(void);
-void __tsan_co_destroy(void *);
-void __tsan_co_switch(void *);
-void __tsan_co_set_name(void *, const char *);
+#include <sanitizer/tsan_interface.h>
 #endif
 
 /* very perf sensetive to be in production */
 #define co_log(...)	/* pcs_log(__VA_ARGS__) */
 
-static void runqueue_put(struct pcs_co_list *runqueue, struct pcs_coroutine *co)
+#define GLOBAL_RUNQUEUE_PERIOD	16
+
+static int runqueue_put(struct pcs_evloop_runqueue *runqueue, struct pcs_coroutine *co)
 {
-	cd_list_add_tail(&co->run_list, &runqueue->list);
-	runqueue->nr++;
+	u32 tail = pcs_atomic32_load(&runqueue->tail);
+	u32 head = pcs_atomic32_load(&runqueue->head);
+	u32 size = tail - head;
+
+	if (size == PCS_EVLOOP_RUNQUEUE_SIZE)
+		return 0;
+
+	BUG_ON(size > PCS_EVLOOP_RUNQUEUE_SIZE);
+	runqueue->buf[tail % PCS_EVLOOP_RUNQUEUE_SIZE] = co;
+	pcs_wmb();
+	/* no need to use CAS beacause tail is updated only by eventloop thread */
+	pcs_atomic32_store(&runqueue->tail, tail + 1);
+	return 1;
 }
 
-static struct pcs_coroutine *runqueue_get(struct pcs_co_list *runqueue)
+static struct pcs_coroutine *runqueue_get(struct pcs_evloop_runqueue *runqueue)
 {
-	if (!runqueue->nr)
-		return NULL;
+	u32 tail = pcs_atomic32_load(&runqueue->tail);
+	u32 head = pcs_atomic32_load(&runqueue->head);
+	for (;;) {
+		u32 size = tail - head;
+		if (size == 0)
+			return NULL;
 
-	BUG_ON(cd_list_empty(&runqueue->list));
-	struct pcs_coroutine *co = cd_list_first_entry(&runqueue->list, struct pcs_coroutine, run_list);
-	cd_list_del_init(&co->run_list);
-	runqueue->nr--;
-	return co;
+		BUG_ON(size > PCS_EVLOOP_RUNQUEUE_SIZE);
+		struct pcs_coroutine *co = runqueue->buf[head % PCS_EVLOOP_RUNQUEUE_SIZE];
+		u32 res = pcs_atomic32_cas(&runqueue->head, head, head + 1);
+		if (res == head)
+			return co;
+
+		head = res;
+	}
+}
+
+static u32 runqueue_steal(struct pcs_evloop_runqueue *runqueue, struct pcs_coroutine* buf[], u32 buf_sz)
+{
+	u32 head = pcs_atomic32_load(&runqueue->head);
+	u32 tail = pcs_atomic32_load(&runqueue->tail);
+	u32 size = tail - head;
+	size = (size + 1) / 2; // do not steal more then half of all coroutines
+	if (size == 0)
+		return 0;
+
+	if (size > buf_sz)
+		size = buf_sz;
+	buf += size - 1;
+
+	u32 i;
+	for (i = 0; i < size; i++)
+		*(buf - i) = runqueue->buf[(head + i) % PCS_EVLOOP_RUNQUEUE_SIZE];
+
+	for (;;) {
+		u32 delta = pcs_atomic32_cas(&runqueue->head, head, head + size) - head;
+		if (delta == 0)
+			return size;
+
+		if (delta >= size)
+			return 0;
+
+		head += delta;
+		size -= delta;
+	}
 }
 
 static void add_to_runqueue(struct pcs_evloop *evloop, struct pcs_coroutine *co)
 {
+	struct pcs_process *proc = evloop->proc;
 	co->evloop = evloop;
+	while (!runqueue_put(&evloop->co_runqueue, co)) {
+		struct pcs_coroutine *buf[PCS_EVLOOP_RUNQUEUE_SIZE / 2];
+		u32 nr = runqueue_steal(&evloop->co_runqueue, buf, PCS_EVLOOP_RUNQUEUE_SIZE / 2);
+		if (!nr)
+			continue;
 
-	unsigned int idx = evloop->co_runqueue_cur ^ (co->sched_seq == evloop->co_sched_seq);
-	struct pcs_co_list *runqueue = &evloop->co_runqueue[idx];
-	runqueue_put(runqueue, co);
+		CD_LIST_HEAD(list);
+		u32 i;
+		for (i = 0; i < nr; i++)
+			cd_list_add(&buf[i]->run_list, &list);
+
+		pthread_mutex_lock(&proc->co_runqueue_mutex);
+		cd_list_splice_tail(&list, &proc->co_runqueue);
+		pcs_atomic32_add(&proc->co_runqueue_nr, nr);
+		pthread_mutex_unlock(&proc->co_runqueue_mutex);
+	}
+
+	int co_ready_count = pcs_atomic32_fetch_and_inc(&proc->co_ready_count);
+	int polling_evloops_count = pcs_atomic32_load(&proc->polling_evloops_count);
+	if (polling_evloops_count && co_ready_count > proc->nr_evloops - polling_evloops_count) {
+		if (!pcs_atomic32_cas(&proc->evloop_wakeup_event_sent, 0, 1))
+			pcs_event_ioconn_wakeup(proc->evloop_wakeup_event);
+	}
 }
 
-int pcs_co_find_runnable(struct pcs_evloop *evloop)
+void pcs_co_steal(struct pcs_evloop *evloop)
 {
-	return evloop->co_runqueue[0].nr || evloop->co_runqueue[1].nr;
+	struct pcs_process *proc = evloop->proc;
+	u32 idx = evloop->steal_target;
+
+	for (;;)
+	{
+		idx++;
+		if (idx >= proc->nr_evloops)
+			idx = 0;
+		if (idx == evloop->id)
+			continue;
+		if (idx == evloop->steal_target)
+			break;
+
+		struct pcs_coroutine *buf[PCS_EVLOOP_RUNQUEUE_SIZE / 2];
+		u32 nr = runqueue_steal(&proc->evloops[idx].co_runqueue, buf, PCS_EVLOOP_RUNQUEUE_SIZE / 2);
+		if (!nr)
+			continue;
+
+		u32 i;
+		for (i = 0; i < nr; i++) {
+			struct pcs_coroutine *co = buf[i];
+			co->evloop = evloop;
+			int rc = runqueue_put(&evloop->co_runqueue, co);
+			BUG_ON(!rc);
+		}
+
+		evloop->steal_target = idx;
+		break;
+	}
 }
 
-static struct pcs_coroutine* get_runnable_co(struct pcs_evloop *evloop)
+static struct pcs_coroutine *global_runqueue_get(struct pcs_process *proc)
 {
-	struct pcs_co_list *runqueue = &evloop->co_runqueue[evloop->co_runqueue_cur];
-	struct pcs_coroutine *co = runqueue_get(runqueue);
-	if (!co)
+	if (!pcs_atomic32_load(&proc->co_runqueue_nr))
 		return NULL;
 
-	BUG_ON(co->sched_seq == evloop->co_sched_seq);
+	pthread_mutex_lock(&proc->co_runqueue_mutex);
+	u32 nr = pcs_atomic32_load(&proc->co_runqueue_nr);
+	if (!nr) {
+		pthread_mutex_unlock(&proc->co_runqueue_mutex);
+		return NULL;
+	}
+
+	BUG_ON(cd_list_empty(&proc->co_runqueue));
+	struct pcs_coroutine *co = cd_list_first_entry(&proc->co_runqueue, struct pcs_coroutine, run_list);
+	cd_list_del_init(&co->run_list);
+
+	pcs_atomic32_store(&proc->co_runqueue_nr, nr - 1);
+	pthread_mutex_unlock(&proc->co_runqueue_mutex);
+	return co;
+}
+
+static struct pcs_coroutine *get_runnable_co(struct pcs_evloop *evloop)
+{
+	struct pcs_process* proc = evloop->proc;
+	struct pcs_coroutine *co;
+
+	if ((co = evloop->co_next)) {
+		evloop->co_next = NULL;
+		goto done;
+	}
+
+	if (evloop->co_ctx_switches % GLOBAL_RUNQUEUE_PERIOD) {
+		if ((co = runqueue_get(&evloop->co_runqueue)))
+			goto found;
+		if ((co = global_runqueue_get(proc))) {
+			co->evloop = evloop;
+			goto found;
+		}
+	} else {
+		if ((co = global_runqueue_get(proc))) {
+			co->evloop = evloop;
+			goto found;
+		}
+		if ((co = runqueue_get(&evloop->co_runqueue)))
+			goto found;
+	}
+	return NULL;
+
+found:
+	/* If polling was not performed since last run of the same coroutine,
+	 * do polling before starting coroutine again.
+	 * This behaviour is important for single-threaded eventloop beacause
+	 * it allows to process I/O events during execution of CPU-intensive
+	 * coroutine that periodically call pcs_co_schedule().
+	 * As it is impossible to put coroutine back into queue head,
+	 * we store it in co_next field. */
+	if (co->poll_count == evloop->poll_count && !pcs_atomic32_load(&proc->polling_evloops_count))
+	{
+		evloop->co_next = co;
+		return NULL;
+	}
+done:;
 	s32 old_state = pcs_atomic32_exchange(&co->state, CO_RUNNING);
 	BUG_ON((old_state & ~CO_BACKTRACE) != CO_READY);
 	if (unlikely(old_state & CO_BACKTRACE)) {
@@ -199,7 +348,7 @@ struct co_migrate_job
 	size_t				stack_size;
 #endif
 #ifdef PCS_THREAD_SANIT
-	void				*tsan_state;
+	void				*tsan_fiber;
 #endif
 };
 
@@ -232,8 +381,6 @@ static void pcs_co_switch_finish(struct pcs_coroutine *current)
 	if (unlikely(!evloop))
 		return;
 
-	__tsan_acquire(evloop);
-
 	struct pcs_coroutine *co = evloop->co_current;
 	if (evloop->wait_on) {
 		/* We have switch away from the coroutine that called pcs_co_event_wait().
@@ -261,19 +408,17 @@ static void pcs_co_switch_finish(struct pcs_coroutine *current)
 
 		case CO_ZOMBIE:
 #ifdef PCS_THREAD_SANIT
-			if (!co->tsan.keep_state) {
-				__tsan_co_destroy(co->tsan.state);
-				co->tsan.state = NULL;
+			if (!co->tsan.keep_fiber) {
+				__tsan_destroy_fiber(co->tsan.fiber);
+				co->tsan.fiber = NULL;
 			}
 #endif
 			break;
 		}
 	}
 
-	current->sched_seq = evloop->co_sched_seq;
+	current->poll_count = evloop->poll_count;
 	pcs_co_set_current(current);
-
-	__tsan_release(evloop);
 }
 
 static void pcs_co_switch(struct pcs_coroutine * current, struct pcs_coroutine * co)
@@ -293,9 +438,8 @@ static void pcs_co_switch(struct pcs_coroutine * current, struct pcs_coroutine *
 	__sanitizer_start_switch_fiber(&fake_stack, co->asan.stack_bottom, co->asan.stack_size);
 #endif
 #ifdef PCS_THREAD_SANIT
-	void *tsan_state = co->tsan.state;
-	__tsan_release(evloop);
-	__tsan_co_switch(tsan_state);
+	void *tsan_fiber = co->tsan.fiber;
+	__tsan_switch_to_fiber(tsan_fiber, 0);
 #endif
 	pcs_ucontext_switch(&current->context, &co->context);
 #ifdef PCS_ADDR_SANIT
@@ -347,14 +491,9 @@ static void pcs_co_pool_apply_limit(struct pcs_evloop *evloop)
 /* Internal for pcs_process event loop: coroutines are processed using this function */
 void pcs_co_run(struct pcs_evloop * evloop)
 {
-	__tsan_acquire(evloop);
-
 	struct pcs_coroutine *co = get_runnable_co(evloop);
 	if (co)
 		pcs_co_switch(evloop->co_current, co);
-
-	evloop->co_runqueue_cur ^= 1;
-	evloop->co_sched_seq += 1 << 8;
 
 	pcs_co_pool_apply_limit(evloop);
 }
@@ -410,13 +549,20 @@ void pcs_co_bt(void)
 void pcs_co_schedule(void)
 {
 	struct pcs_evloop *evloop = pcs_current_evloop;
+	struct pcs_coroutine *co;
 
-	__tsan_acquire(evloop);
+	/* Deaccount coroutine that finished execution */
+	pcs_atomic32_dec(&evloop->proc->co_ready_count);
 
-	struct pcs_coroutine *co = get_runnable_co(evloop);
-	if (!co)
-		co = evloop->co_idle;
+	if (!pcs_process_need_poll(evloop)) {
+		if ((co = get_runnable_co(evloop))) {
+			pcs_process_ping_watchdog(evloop);
+			goto done;
+		}
+	}
 
+	co = evloop->co_idle;
+done:
 	pcs_co_switch(evloop->co_current, co);
 }
 
@@ -509,7 +655,7 @@ static void pcs_co_alloc_ctx(struct pcs_coroutine * co)
 	co->asan.stack_size = PCS_CO_STACK_SIZE;
 #endif
 #ifdef PCS_THREAD_SANIT
-	co->tsan.state = __tsan_co_create();
+	co->tsan.fiber = __tsan_create_fiber(0);
 #endif
 #ifdef USE_VALGRIND
 	co->valgrind.stack_id = VALGRIND_STACK_REGISTER(co->stack + page_size, co->stack + page_size + PCS_CO_STACK_SIZE);
@@ -524,7 +670,7 @@ static void pcs_co_refresh_ctx(struct pcs_coroutine * co)
 #ifdef PCS_THREAD_SANIT
 	unsigned int page_size = sysconf(_SC_PAGESIZE);
 	pcs_ucontext_init(&co->context, (u8 *)co->stack + page_size, PCS_CO_STACK_SIZE, _coroutine_start, co);
-	co->tsan.state = __tsan_co_create();
+	co->tsan.fiber = __tsan_create_fiber(0);
 #endif
 }
 
@@ -552,6 +698,7 @@ struct pcs_coroutine * pcs_co_create(struct pcs_context *ctx, int (*func)(struct
 	co->func = func;
 	co->func_arg = arg;
 	co->ctx = pcs_context_get(ctx);
+	co->poll_count = 1;	/* any odd value is OK because evloop->poll_count is always even */
 	pcs_atomic32_store(&co->state, CO_READY);
 	add_to_runqueue(evloop, co);
 	return co;
@@ -617,7 +764,7 @@ int pcs_co_wait_timeout(int * timeout_p)
 	return res;
 }
 
-static void pcs_co_filejob_init(struct pcs_process * proc)
+void pcs_co_filejob_init(struct pcs_process * proc)
 {
 	const int nr_processors = pcs_nr_processors();
 
@@ -648,7 +795,7 @@ static void pcs_co_filejob_init(struct pcs_process * proc)
 	}
 }
 
-static void pcs_co_filejob_fini(struct pcs_process * proc)
+void pcs_co_filejob_fini(struct pcs_process * proc)
 {
 	if (proc->co_io) {
 		pcs_file_job_conn_stop(proc->co_io);
@@ -662,12 +809,6 @@ static void pcs_co_filejob_fini(struct pcs_process * proc)
 		pcs_file_job_conn_stop(proc->co_ssl);
 		proc->co_ssl = NULL;
 	}
-}
-
-static void pcs_co_term_job(void * arg)
-{
-	struct pcs_process * proc = arg;
-	pcs_co_filejob_fini(proc);
 }
 
 struct _co_file_job
@@ -706,7 +847,7 @@ void pcs_co_set_name_fixed(struct pcs_coroutine * co, const char *name)
 {
 	co->name = name;
 #ifdef PCS_THREAD_SANIT
-	__tsan_co_set_name(co->tsan.state, name);
+	__tsan_set_fiber_name(co->tsan.fiber, name);
 #endif
 }
 
@@ -733,9 +874,8 @@ static int migrate_job_run(void *arg)
 	__sanitizer_start_switch_fiber(&fake_stack, co->asan.stack_bottom, co->asan.stack_size);
 #endif
 #ifdef PCS_THREAD_SANIT
-	co->migrate_job->tsan_state = __tsan_co_current();
-	__tsan_release(co->migrate_job);
-	__tsan_co_switch(co->tsan.state);
+	co->migrate_job->tsan_fiber = __tsan_get_current_fiber();
+	__tsan_switch_to_fiber(co->tsan.fiber, 0);
 #endif
 	pcs_ucontext_switch(&co->migrate_job->context, &co->context);
 #ifdef PCS_ADDR_SANIT
@@ -790,8 +930,7 @@ void pcs_co_migrate_from_thread(struct pcs_coroutine * co)
 	__sanitizer_start_switch_fiber(&fake_stack, co->migrate_job->stack_bottom, co->migrate_job->stack_size);
 #endif
 #ifdef PCS_THREAD_SANIT
-	__tsan_acquire(co->migrate_job);
-	__tsan_co_switch(co->migrate_job->tsan_state);
+	__tsan_switch_to_fiber(co->migrate_job->tsan_fiber, 0);
 #endif
 	pcs_ucontext_switch(&co->context, &co->migrate_job->context);
 #ifdef PCS_ADDR_SANIT
@@ -827,7 +966,7 @@ struct thread_coroutine
 	pthread_mutex_t			wait_mutex;
 	struct pcs_ucontext		wait_context;
 #ifdef PCS_THREAD_SANIT
-	void				*wait_tsan_state;
+	void				*wait_tsan_fiber;
 #endif
 	u64				mstack_guard;	/* to detect stack overflow */
 #ifndef __WINDOWS__
@@ -871,9 +1010,8 @@ static void PCS_UCONTEXT_FUNC _co_thread_suspend(void *arg)
 	__sanitizer_start_switch_fiber(NULL, tco->co.asan.stack_bottom, tco->co.asan.stack_size);
 #endif
 #ifdef PCS_THREAD_SANIT
-	void *tsan_state = tco->co.tsan.state;
-	__tsan_release(&tco->wait_context);
-	__tsan_co_switch(tsan_state);
+	void *tsan_fiber = tco->co.tsan.fiber;
+	__tsan_switch_to_fiber(tsan_fiber, 0);
 #endif
 	pcs_ucontext_switch(&tco->wait_context, &tco->co.context);
 	BUG();
@@ -918,10 +1056,10 @@ struct pcs_coroutine * pcs_move_to_coroutine(struct pcs_process * proc)
 	__sanitizer_start_switch_fiber(&fake_stack, tco->mstack + PCS_CO_WAITING_THREAD_SS, PCS_CO_WAITING_THREAD_SS);
 #endif
 #ifdef PCS_THREAD_SANIT
-	tco->co.tsan.state = __tsan_co_current();
-	tco->co.tsan.keep_state = 1;
-	tco->wait_tsan_state = __tsan_co_create();
-	__tsan_co_switch(tco->wait_tsan_state);
+	tco->co.tsan.fiber = __tsan_get_current_fiber();
+	tco->co.tsan.keep_fiber = 1;
+	tco->wait_tsan_fiber = __tsan_create_fiber(0);
+	__tsan_switch_to_fiber(tco->wait_tsan_fiber, 0);
 #endif
 #ifdef USE_VALGRIND
 	tco->co.valgrind.stack_id = VALGRIND_STACK_REGISTER(tco->mstack, tco->mstack + PCS_CO_WAITING_THREAD_SS);
@@ -974,8 +1112,7 @@ void pcs_move_from_coroutine(void)
 
 	/* Back to thread context with thread stack */
 #ifdef PCS_THREAD_SANIT
-	__tsan_acquire(&tco->wait_context);
-	__tsan_co_destroy(tco->wait_tsan_state);
+	__tsan_destroy_fiber(tco->wait_tsan_fiber);
 #endif
 #ifdef USE_VALGRIND
 	VALGRIND_STACK_DEREGISTER(tco->co.valgrind.stack_id);
@@ -998,15 +1135,24 @@ void pcs_move_from_coroutine(void)
 	pcs_free(tco);
 }
 
-void pcs_co_init_proc(struct pcs_process * proc)
+static void evloop_wakeup_cb(void *priv)
+{
+	struct pcs_process *proc = priv;
+	pcs_atomic32_store(&proc->evloop_wakeup_event_sent, 0);
+}
+
+int pcs_co_init_proc(struct pcs_process * proc)
 {
 	pthread_mutex_init(&proc->co_list_mutex, NULL);
 	cd_list_init(&proc->co_list.list);
 	cd_list_init(&proc->co_pool.list);
+	cd_list_init(&proc->co_runqueue);
+	proc->exec_lock = pcs_xmalloc(sizeof(*proc->exec_lock));
+	pcs_co_rwlock_init(proc->exec_lock);
+	if (proc->nr_evloops == 1)
+		return 0;
 
-	pcs_job_init(proc, &proc->co_term_job, pcs_co_term_job, proc);
-	pcs_add_termination_job(&proc->co_term_job);
-	pcs_co_filejob_init(proc);
+	return pcs_event_ioconn_init(proc, &proc->evloop_wakeup_event, evloop_wakeup_cb, proc);
 }
 
 #ifdef PCS_ADDR_SANIT
@@ -1045,20 +1191,21 @@ static void asan_init_co_idle(struct pcs_coroutine *co)
 
 void pcs_co_init_evloop(struct pcs_evloop * evloop)
 {
-	cd_list_init(&evloop->co_runqueue[0].list);
-	cd_list_init(&evloop->co_runqueue[1].list);
 	cd_list_init(&evloop->co_pool.list);
+}
 
+void pcs_co_enter_evloop(struct pcs_evloop * evloop)
+{
 	struct pcs_coroutine *co_idle = __pcs_co_alloc(evloop->proc, 0);
 #ifdef __WINDOWS__
 	co_idle->context.fiber = ConvertThreadToFiber(NULL);
 	if (co_idle->context.fiber == NULL) {
-		pcs_log_syserror(LOG_ERR, GetLastError(), "pcs_co_init_evloop: ConvertThreadToFiber failed");
+		pcs_log_syserror(LOG_ERR, GetLastError(), "pcs_co_enter_evloop: ConvertThreadToFiber failed");
 		BUG();
 	}
 #endif
 #ifdef PCS_THREAD_SANIT
-	co_idle->tsan.state = __tsan_co_current();
+	co_idle->tsan.fiber = __tsan_get_current_fiber();
 #endif
 	asan_init_co_idle(co_idle);
 	evloop->co_idle = co_idle;
@@ -1069,15 +1216,32 @@ void pcs_co_init_evloop(struct pcs_evloop * evloop)
 
 void pcs_co_fini_proc(struct pcs_process * proc)
 {
+	if (proc->evloop_wakeup_event)
+		pcs_event_ioconn_close(proc->evloop_wakeup_event);
+
 	pcs_co_pool_free(proc, 0);
 	pcs_co_file_pool_free(proc);
+	pcs_free(proc->exec_lock);
+	proc->exec_lock = NULL;
 	BUG_ON(!cd_list_empty(&proc->co_list.list));
 	BUG_ON(!cd_list_empty(&proc->co_pool.list));
+	BUG_ON(!cd_list_empty(&proc->co_runqueue));
 	BUG_ON(proc->co_list.nr);
 	BUG_ON(proc->co_pool.nr);
+	BUG_ON(pcs_atomic32_load(&proc->co_runqueue_nr));
+	BUG_ON(pcs_atomic32_load(&proc->co_ready_count));
+	BUG_ON(pcs_atomic32_load(&proc->polling_evloops_count));
 }
 
 void pcs_co_fini_evloop(struct pcs_evloop * evloop)
+{
+	BUG_ON(evloop->co_next);
+	BUG_ON(runqueue_size(&evloop->co_runqueue));
+	BUG_ON(!cd_list_empty(&evloop->co_pool.list));
+	BUG_ON(evloop->co_pool.nr);
+}
+
+void pcs_co_exit_evloop(struct pcs_evloop * evloop)
 {
 	struct pcs_process *proc = evloop->proc;
 	pthread_mutex_lock(&proc->co_list_mutex);
@@ -1086,14 +1250,8 @@ void pcs_co_fini_evloop(struct pcs_evloop * evloop)
 	cd_list_del(&evloop->co_idle->list);
 	proc->co_list.nr--;
 	pthread_mutex_unlock(&proc->co_list_mutex);
-
-	BUG_ON(!cd_list_empty(&evloop->co_runqueue[0].list));
-	BUG_ON(!cd_list_empty(&evloop->co_runqueue[1].list));
-	BUG_ON(evloop->co_runqueue[0].nr);
-	BUG_ON(evloop->co_runqueue[1].nr);
-	BUG_ON(!cd_list_empty(&evloop->co_pool.list));
-	BUG_ON(evloop->co_pool.nr);
 	pcs_free(evloop->co_idle);
+
 #ifdef __WINDOWS__
 	ConvertFiberToThread();
 #endif

@@ -65,4 +65,7 @@ PCS_API int pcs_bug_ignore_spec(const char *spec);
 /* Read PSTORAGE_DBG_BUGON environment variable and set pcs_dbg_bugon_enable accordingly */
 PCS_API void pcs_dbg_bugon_init(void);
 
+/* Abort execution gracefully terminating log and calling registerd handlers (see below) */
+PCS_API void __noreturn pcs_abort(void);
+
 #endif

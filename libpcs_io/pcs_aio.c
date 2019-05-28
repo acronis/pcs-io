@@ -19,15 +19,17 @@
 
 #define AIO_TERMINATE_TIMEOUT (60*1000)
 
-#if defined(HAVE_EVENTFD) && defined(HAVE_AIO)
+#ifdef HAVE_AIO
+
+#include <sys/syscall.h>
 
 static int translate_error(struct pcs_aioreq * req, int errval)
 {
 	switch (errval) {
-	case -ENOSPC:
-	case -EDQUOT:
+	case ENOSPC:
+	case EDQUOT:
 		return PCS_ERR_NOSPACE;
-	case -EFAULT:
+	case EFAULT:
 		pcs_fatal("aio error: EFAULT");
 	default:
 		return PCS_ERR_IO;
@@ -62,36 +64,36 @@ pcs_thread_ret_t aio_worker(void * arg)
 		while (!cd_list_empty(&local_queue)) {
 			struct pcs_aioreq * req = cd_list_first_entry(&local_queue, struct pcs_aioreq, list);
 			struct iocb * iocb = &req->iocb;
-			int res;
+			int err = 0, res;
 
 			cd_list_del(&req->list);
 
-			if (w->shutdown)
-				res = -EAGAIN;
-			else
-				res = io_submit(aio->ctx, 1, &iocb);
-
-			if (res < 0) {
-				req->error = 0;
-
-				if (res != -EAGAIN) {
-					pcs_log(LOG_ERR, "io_submit error %d", res);
-					req->error = translate_error(req, res);
+			if (!w->shutdown) {
+				if ((res = syscall(SYS_io_submit, aio->ctx, 1L, &iocb)) >= 0) {
+					BUG_ON(res != 1);
+					w->served++;
+					continue;
 				}
 
-				/* In case of failure of io_submit, we return
-				 * requests to special error_queue and manually
-				 * send event to main thread.
-				 */
-				pthread_mutex_lock(&aio->error_lock);
-				cd_list_add_tail(&req->list, &aio->error_queue);
-				aio->error_count++;
-				pthread_mutex_unlock(&aio->error_lock);
-
-				pcs_event_ioconn_wakeup(aio->ioconn);
-			} else {
-				w->served++;
+				res = errno;
+				if (res != EAGAIN) {
+					err = translate_error(req, res);
+					pcs_log_syserror(LOG_ERR, res, "io_submit error");
+				}
 			}
+
+			req->error = err;
+
+			/* In case of failure of io_submit, we return
+			 * requests to special error_queue and manually
+			 * send event to main thread.
+			 */
+			pthread_mutex_lock(&aio->error_lock);
+			cd_list_add_tail(&req->list, &aio->error_queue);
+			aio->error_count++;
+			pthread_mutex_unlock(&aio->error_lock);
+
+			pcs_event_ioconn_wakeup(aio->ioconn);
 		}
 
 		pthread_mutex_lock(&w->lock);
@@ -104,7 +106,7 @@ static void kick_same_aio(struct pcs_aio * aio)
 {
 	struct iocb * iocbs[aio->queued];
 	struct pcs_aioreq * req;
-	int n = 0;
+	long n = 0;
 	int i;
 
 	cd_list_for_each_entry(struct pcs_aioreq, req, &aio->queue, list) {
@@ -114,23 +116,23 @@ static void kick_same_aio(struct pcs_aio * aio)
 	if (n == 0)
 		return;
 
-	i = io_submit(aio->ctx, n, iocbs);
-	if (i < 0) {
+	if ((i = syscall(SYS_io_submit, aio->ctx, n, iocbs)) < 0) {
 		int err = errno;
 
-		if (i != -EAGAIN) {
-			pcs_log(0, "io_submit error %d, errno = %d", i, err);
-			while (!cd_list_empty(&aio->queue)) {
-				req = cd_list_first_entry(&aio->queue,
-							  struct pcs_aioreq, list);
-				cd_list_del(&req->list);
-
-				req->error = translate_error(req, i);
-				req->complete(req);
-				aio->queued--;
-			}
-		} else {
+		if (err == EAGAIN) {
 			BUG_ON(aio->pending == 0);
+			return;
+		}
+
+		pcs_log_syserror(LOG_ERR, err, "io_submit error");
+		while (!cd_list_empty(&aio->queue)) {
+			req = cd_list_first_entry(&aio->queue,
+						  struct pcs_aioreq, list);
+			cd_list_del(&req->list);
+
+			req->error = translate_error(req, err);
+			req->complete(req);
+			aio->queued--;
 		}
 		return;
 	}
@@ -237,13 +239,13 @@ static void wait_requests(struct pcs_aio * aio, struct timespec * ts)
 		}
 	}
 
-	n = io_getevents(aio->ctx, 1, aio->pending, ev, ts);
+	n = syscall(SYS_io_getevents, aio->ctx, 1L, (long)aio->pending, ev, ts);
 	if (n <= 0)
 		return;
 
 	for (i = 0; i < n; i++) {
 		long err;
-		struct iocb * ioc = ev[i].obj;
+		struct iocb * ioc = (struct iocb *)ev[i].obj;
 		struct pcs_aioreq * req = container_of(ioc, struct pcs_aioreq, iocb);
 
 		req->error = 0;
@@ -251,11 +253,11 @@ static void wait_requests(struct pcs_aio * aio, struct timespec * ts)
 			req->error = PCS_ERR_PROTOCOL;
 		err = (long)ev[i].res;
 		if (err < 0) {
-			req->error = translate_error(req, err);
+			req->error = translate_error(req, -err);
 			pcs_log(0, "aio error %ld", err);
 		} else if (err != (long)req->count) {
 			pcs_log(0, "aio short io %ld, expected %ld, pos=%llu", err, (long)req->count,
-				(unsigned long long)req->iocb.u.c.offset);
+				(llu)req->iocb.aio_offset);
 			if (!(req->flags & PCS_AIO_F_WRITE) && (req->flags & PCS_AIO_F_PAD)) {
 				struct stat stb;
 
@@ -265,8 +267,8 @@ static void wait_requests(struct pcs_aio * aio, struct timespec * ts)
 				 * It looks like client does not respect file size somewhere.
 				 */
 				if (!fstat(req->iocb.aio_fildes, &stb) &&
-				    stb.st_size < req->iocb.u.c.offset + (off_t)req->count)
-					memset(req->iocb.u.c.buf + err, 0, req->count - err);
+				    stb.st_size < req->iocb.aio_offset + (off_t)req->count)
+					memset((u8 *)req->iocb.aio_buf + err, 0, req->count - err);
 				else
 					req->error = PCS_ERR_IO;
 			} else
@@ -290,7 +292,7 @@ static void data_ready(void *priv)
 	if (aio->queued)
 		kick_queue(aio);
 }
-#else /* HAVE_EVENTFD */
+#else /* HAVE_AIO */
 static void kick_queue(struct pcs_aio * aio)
 {
 	pcs_job_wakeup(&aio->job);
@@ -307,10 +309,10 @@ static void aio_sync_job(void *data)
 		cd_list_del(&req->list);
 
 restart:
-		if (req->iocb.write)
-			n = pwrite(req->iocb.fd, req->iocb.buf, req->iocb.count, req->iocb.offset);
+		if (req->flags & PCS_AIO_F_WRITE)
+			n = pwrite(req->fd, req->buf, req->count, req->pos);
 		else
-			n = pread(req->iocb.fd, req->iocb.buf, req->iocb.count, req->iocb.offset);
+			n = pread(req->fd, req->buf, req->count, req->pos);
 
 		if (n < 0 && errno == EINTR)
 			goto restart;
@@ -336,39 +338,25 @@ struct pcs_aio * pcs_aio_init(struct pcs_process * proc, int threads)
 	int i;
 	struct pcs_aio * aio;
 
-#if defined(HAVE_EVENTFD) && defined(HAVE_AIO)
-	if (threads & (threads - 1))
-		return NULL;
+#ifdef HAVE_AIO
+	BUG_ON(threads & (threads - 1));
 #else
 	threads = 0;
 #endif
 
-	aio = pcs_malloc(sizeof(struct pcs_aio) + threads * sizeof(struct pcs_aio_worker));
-	if (!aio)
-		return NULL;
-
-#if defined(HAVE_EVENTFD) && defined(HAVE_AIO)
-	memset(&aio->ctx, 0, sizeof(aio->ctx));
-#endif
+	aio = pcs_xzmalloc(sizeof(struct pcs_aio) + threads * sizeof(struct pcs_aio_worker));
 
 	cd_list_init(&aio->queue);
-	aio->queued = 0;
-	aio->shutdown = 0;
 
 	aio->max_threads = threads;
-	aio->threads = 0;
 	aio->salt = get_real_time_us();
 
 	pthread_mutex_init(&aio->error_lock, NULL);
 	cd_list_init(&aio->error_queue);
-	aio->error_count = 0;
-
-	aio->pending = 0;
 
 	for (i = 0; i < threads; i++) {
 		struct pcs_aio_worker * w = aio->workers + i;
 
-		memset(w, 0, sizeof(*w));
 		cd_list_init(&w->queue);
 		w->idx = i;
 		pthread_mutex_init(&w->lock, NULL);
@@ -379,23 +367,16 @@ struct pcs_aio * pcs_aio_init(struct pcs_process * proc, int threads)
 
 int pcs_aio_start(struct pcs_process * proc, struct pcs_aio * aio)
 {
-#if defined(HAVE_EVENTFD) && defined(HAVE_AIO)
-	int maxreqs;
+#ifdef HAVE_AIO
+	unsigned maxreqs = PCS_AIO_MAXREQS;
 	int err;
 
-	maxreqs = PCS_AIO_MAXREQS;
-	while (maxreqs > 0) {
-		if ((err = io_setup(maxreqs, &aio->ctx)) == 0)
-			break;
+	while (syscall(SYS_io_setup, maxreqs, &aio->ctx) < 0) {
+		if (errno != EAGAIN || maxreqs < 2)
+			return -1;
 		maxreqs /= 2;
-		if (err != -EAGAIN)
-			maxreqs = 0;
 	}
 
-	if (maxreqs == 0) {
-		errno = -err;
-		return -1;
-	}
 	aio->acquired_reqs = maxreqs;
 
 	if ((err = pcs_event_ioconn_init(proc, &aio->ioconn, data_ready, aio))) {
@@ -412,8 +393,9 @@ void pcs_aioreq_submit(struct pcs_aio * aio, struct pcs_aioreq * req)
 {
 	BUG_ON(!pcs_in_evloop());
 
-#if defined(HAVE_EVENTFD) && defined(HAVE_AIO)
-	io_set_eventfd(&req->iocb, aio->ioconn->send_event_fd);
+#ifdef HAVE_AIO
+	req->iocb.aio_flags = IOCB_FLAG_RESFD;
+	req->iocb.aio_resfd = aio->ioconn->send_event_fd;
 #endif
 
 	cd_list_add_tail(&req->list, &aio->queue);

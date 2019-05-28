@@ -10,27 +10,24 @@
 #include "pcs_thread.h"
 #include "pcs_error.h"
 
-#if defined(HAVE_AIO) && defined(HAVE_EVENTFD)
-#include <libaio.h>
+#include <string.h>
+
+#ifdef HAVE_AIO
+#define _LINUX_MOUNT_H	/* workaround incompatiblity with <sys/mount.h> */
+#include <linux/aio_abi.h>
 #endif
 
 #define PCS_AIO_MAXREQS	128
 
-#if !defined(HAVE_AIO) || !defined(HAVE_EVENTFD)
-/* for AIO emulation */
-struct iocb {
-	int fd;
-	int write;		/* 0 == read */
-	void *buf;
-	size_t count;
-	long long offset;
-};
-#endif
-
 struct pcs_aioreq
 {
 	struct cd_list	list;
+#ifdef HAVE_AIO
 	struct iocb	iocb;
+#else
+	int		fd;
+	void		*buf;
+#endif
 	u64		pos;
 	size_t		count;
 	int		error;
@@ -66,9 +63,9 @@ struct pcs_aio
 	int			shutdown;
 	int			max_threads;
 	int			threads;
-#if defined(HAVE_EVENTFD) && defined(HAVE_AIO)
+#ifdef HAVE_AIO
 	struct pcs_event_ioconn	*ioconn;
-	io_context_t		ctx;
+	aio_context_t		ctx;
 #else
 	struct pcs_job		job;
 #endif
@@ -84,34 +81,23 @@ struct pcs_aio
 	struct pcs_aio_worker	workers[0];
 };
 
-#if !defined(HAVE_AIO) || !defined(HAVE_EVENTFD)
-static inline void io_prep(struct iocb *iocb, int write, int fd, void *buf, size_t count, long long offset)
-{
-	iocb->write = write;
-	iocb->fd = fd;
-	iocb->buf = buf;
-	iocb->count = count;
-	iocb->offset = offset;
-}
-
-static inline void io_prep_pread(struct iocb *iocb, int fd, void *buf, size_t count, long long offset)
-{
-	io_prep(iocb, 0, fd, buf, count, offset);
-}
-
-static inline void io_prep_pwrite(struct iocb *iocb, int fd, void *buf, size_t count, long long offset)
-{
-	io_prep(iocb, 1, fd, buf, count, offset);
-}
-#endif
-
 static inline void pcs_aio_pread(struct pcs_aioreq *req, int fd, void *buf,
 				 size_t count, long long offset)
 {
 	req->pos = offset;
 	req->count = count;
 	req->flags = 0;
-	io_prep_pread(&req->iocb, fd, buf, count, offset);
+#ifdef HAVE_AIO
+	memset(&req->iocb, 0, sizeof(req->iocb));
+	req->iocb.aio_lio_opcode = IOCB_CMD_PREAD;
+	req->iocb.aio_fildes = fd;
+	req->iocb.aio_buf = (u64)buf;
+	req->iocb.aio_nbytes = count;
+	req->iocb.aio_offset = offset;
+#else
+	req->fd = fd;
+	req->buf = buf;
+#endif
 }
 
 static inline void pcs_aio_pwrite(struct pcs_aioreq *req, int fd, void *buf,
@@ -120,24 +106,18 @@ static inline void pcs_aio_pwrite(struct pcs_aioreq *req, int fd, void *buf,
 	req->pos = offset;
 	req->count = count;
 	req->flags = PCS_AIO_F_WRITE;
-	io_prep_pwrite(&req->iocb, fd, buf, count, offset);
-}
-
-#if 0	/* not used now and implemented on Linux only */
-static inline void pcs_aio_preadv(struct pcs_aioreq *req, int fd, struct iovec *iov,
-				  int iovcnt, size_t count, long long offset)
-{
-	req->count = count;
-	io_prep_preadv(&req->iocb, fd, iov, iovcnt, offset);
-}
-
-static inline void pcs_aio_pwritev(struct pcs_aioreq *req, int fd, struct iovec *iov,
-				  int iovcnt, size_t count, long long offset)
-{
-	req->count = count;
-	io_prep_pwritev(&req->iocb, fd, iov, iovcnt, offset);
-}
+#ifdef HAVE_AIO
+	memset(&req->iocb, 0, sizeof(req->iocb));
+	req->iocb.aio_lio_opcode = IOCB_CMD_PWRITE;
+	req->iocb.aio_fildes = fd;
+	req->iocb.aio_buf = (u64)buf;
+	req->iocb.aio_nbytes = count;
+	req->iocb.aio_offset = offset;
+#else
+	req->fd = fd;
+	req->buf = buf;
 #endif
+}
 
 void pcs_aioreq_init(struct pcs_aioreq *);
 void pcs_aioreq_free(struct pcs_aio *, struct pcs_aioreq *);

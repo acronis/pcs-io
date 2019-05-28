@@ -310,26 +310,6 @@ u32 __bufqueue_move(struct malloc_item **p_mi, const char *file, int check, stru
 	return size;
 }
 
-u32 bufqueue_get_size(const struct bufqueue *bq)
-{
-	return bq->total_size;
-}
-
-int bufqueue_empty(const struct bufqueue *bq)
-{
-	return bq->total_size == 0;
-}
-
-__no_sanitize_thread int bufqueue_empty_unsafe(const struct bufqueue *bq)
-{
-	return bq->total_size == 0;
-}
-
-int bufqueue_no_space(const struct bufqueue *bq)
-{
-	return bq->total_size >= bq->size_limit;
-}
-
 void bufqueue_peek_shbuf(struct bufqueue *bq, struct bufqueue_shbuf **shbuf, void **data, u32 size)
 {
 	BUG_ON(cd_list_empty(&bq->buffers));
@@ -448,6 +428,46 @@ u32 bufqueue_peek_next(const struct bufqueue *bq, void **data, struct bufqueue_i
 	*data = b->head;
 	iter->pos = b->node.next;
 	return b->size;
+}
+
+int bufqueue_peek_at_iov(const struct bufqueue *bq, u32 offset, struct iovec *iov, int iovcnt, struct bufqueue_iter *iter)
+{
+	BUG_ON(iovcnt < 1);
+
+	struct buffer *b;
+	cd_list_for_each_entry(struct buffer, b, &bq->buffers, node) {
+		if (offset < b->size) {
+			iov[0].iov_base = b->head + offset;
+			iov[0].iov_len = b->size - offset;
+
+			struct bufqueue_iter i = {b->node.next};
+			int r = 1 + bufqueue_peek_next_iov(bq, &iov[1], iovcnt - 1, &i);
+
+			if (iter)
+				*iter = i;
+
+			return r;
+		}
+		offset -= b->size;
+	}
+
+	return 0;
+}
+
+int bufqueue_peek_next_iov(const struct bufqueue *bq, struct iovec *iov, int iovcnt, struct bufqueue_iter *iter)
+{
+	int r = 0;
+	while (iovcnt > 0 && iter->pos != &bq->buffers) {
+		struct buffer *b = cd_list_entry(iter->pos, struct buffer, node);
+		iov->iov_base = b->head;
+		iov->iov_len = b->size;
+
+		++r;
+		++iov;
+		--iovcnt;
+		iter->pos = iter->pos->next;
+	}
+	return r;
 }
 
 u32 bufqueue_peek_range(const struct bufqueue *bq, u32 offset, u32 size, void *data)

@@ -28,7 +28,8 @@
 #include "timer.h"
 #include "pcs_atomic.h"
 
-#define PCS_MAX_POLL_INTERVAL	250 /* usec */
+#define MAX_POLL_INTERVAL	250		/* usec */
+#define WATCHDOG_PING_INTERVAL	(500 * 1000)	/* usec */
 
 /* Jobs. Actually, job is a special case of timer with zero timeout.
  * So that this code is redundant. It is just cheaper, no tree balancing etc.
@@ -219,28 +220,65 @@ static int has_tasks_to_do(struct pcs_evloop *evloop)
 {
 	if (pending_jobs(evloop))
 		return 1;
-	if (pcs_co_find_runnable(evloop))
+	if (evloop->co_next)
+		return 1;
+	if (runqueue_size(&evloop->co_runqueue))
+		return 1;
+	if (pcs_atomic32_load(&evloop->proc->co_runqueue_nr))
 		return 1;
 	return evloop->closing;
 }
 
 static void poll_io_events(struct pcs_evloop *evloop, int timeout)
 {
+	struct pcs_process *proc = evloop->proc;
+	pcs_atomic32_inc(&proc->polling_evloops_count);
 	pcs_profiler_leave(evloop, 0);
-	pcs_watchdog_enter_poll(evloop);
+	evloop->poll_count++;
 	pcs_poll_wait(evloop, timeout);
-	pcs_watchdog_leave_poll(evloop);
+	evloop->poll_count++;
 	pcs_profiler_enter(evloop);
+	pcs_atomic32_dec(&proc->polling_evloops_count);
 }
 
-static void warn_evloop_not_working(struct pcs_evloop *evloop, abs_time_t last_poll)
+static void warn_evloop_not_working(struct pcs_evloop *evloop)
 {
-	abs_time_t elapsed = get_elapsed_time(evloop->last_abs_time_us, last_poll);
+	abs_time_t elapsed = get_elapsed_time(evloop->last_abs_time_us, evloop->last_poll_time_us);
 	if (elapsed > PCS_LOOP_WATCHDOG_TIME * 1000)
 		pcs_log(LOG_WARN, "watchdog: pcs evloop #%d was not working for %llu sec", evloop->id, (llu)elapsed/1000000);
 }
 
-static pcs_thread_ret_t pcs_process_eventloop(void * arg)
+int pcs_process_need_poll(struct pcs_evloop *evloop)
+{
+	if (pending_jobs(evloop) || evloop->closing)
+		return 1;
+
+	set_abs_time_fast(evloop);
+	if (evloop->last_abs_time_us < evloop->last_poll_time_us + MAX_POLL_INTERVAL)
+		return 0;
+
+	if (!pcs_atomic32_load(&evloop->proc->polling_evloops_count))
+		return 1;
+
+	if (!get_timers_timeout(&evloop->timers))
+		return 1;
+
+	return 0;
+}
+
+void pcs_process_ping_watchdog(struct pcs_evloop *evloop)
+{
+	if (evloop->last_abs_time_us < evloop->last_poll_time_us + WATCHDOG_PING_INTERVAL)
+		return;
+
+	evloop->poll_count += 2;
+	pcs_profiler_leave(evloop, 0);
+	pcs_profiler_enter(evloop);
+	warn_evloop_not_working(evloop);
+	evloop->last_poll_time_us = evloop->last_abs_time_us;
+}
+
+pcs_thread_ret_t pcs_process_eventloop(void * arg)
 {
 	struct pcs_evloop *evloop = (struct pcs_evloop *)arg;
 	struct pcs_process *proc = evloop->proc;
@@ -248,16 +286,19 @@ static pcs_thread_ret_t pcs_process_eventloop(void * arg)
 	eventloop_enter(evloop);
 
 	set_abs_time_fast(evloop);
-	pcs_co_init_evloop(evloop);
+	pcs_co_enter_evloop(evloop);
 	pcs_profiler_start(evloop);
 	pcs_watchdog_init_evloop(evloop);
+
+	if (evloop->id == 0)
+		pcs_co_filejob_init(proc);
 
 	pcs_thread_barrier_wait(&proc->barrier);
 
 	pcs_profiler_enter(evloop);
 	if (evloop->id == 0)
 		pcs_watchdog_start(proc);
-	abs_time_t last_poll = evloop->last_abs_time_us;
+	evloop->last_poll_time_us = evloop->last_abs_time_us;
 
 	while (!evloop->closing) {
 		check_jobs(evloop);
@@ -266,18 +307,17 @@ static pcs_thread_ret_t pcs_process_eventloop(void * arg)
 		int timeout = check_timers(evloop);
 
 		if (has_tasks_to_do(evloop)) {
-			set_abs_time_fast(evloop);
-			if (evloop->last_abs_time_us < last_poll + PCS_MAX_POLL_INTERVAL)
-				continue;
-
+			timeout = 0;
+		} else if (pcs_atomic32_load(&proc->co_ready_count) >= proc->nr_evloops - pcs_atomic32_load(&proc->polling_evloops_count)) {
+			pcs_co_steal(evloop);
 			timeout = 0;
 		}
 
 		poll_io_events(evloop, timeout);
 		set_abs_time_fast(evloop);
 		pcs_poll_process_events(evloop);
-		warn_evloop_not_working(evloop, last_poll);
-		last_poll = evloop->last_abs_time_us;
+		warn_evloop_not_working(evloop);
+		evloop->last_poll_time_us = evloop->last_abs_time_us;
 	}
 
 	check_jobs(evloop);
@@ -288,11 +328,12 @@ static pcs_thread_ret_t pcs_process_eventloop(void * arg)
 	if (evloop->id == 0) {
 		/* Run delayed jobs to kill ioconns, coroutines etc. */
 		run_term_jobs(proc);
+		pcs_co_filejob_fini(proc);
 		pcs_watchdog_stop(proc);
 	}
 
 	eventloop_leave(evloop);
-	pcs_co_fini_evloop(evloop);
+	pcs_co_exit_evloop(evloop);
 	pcs_profiler_stop(evloop);
 
 	return 0;
@@ -402,9 +443,9 @@ static void pcs_init_evloops(struct pcs_process *proc)
 		struct pcs_evloop *evloop = &proc->evloops[i];
 		evloop->proc = proc;
 		evloop->id = i;
-		evloop->co_sched_seq = i;
 		cd_list_init(&evloop->jobs);
 		init_timers(&evloop->timers);
+		pcs_co_init_evloop(evloop);
 	}
 }
 
@@ -438,7 +479,6 @@ int pcs_process_init(struct pcs_process * proc)
 	proc->evloops = pcs_xzmalloc(sizeof(struct pcs_evloop) * proc->nr_evloops);
 
 	pcs_init_evloops(proc);
-	pcs_co_init_proc(proc);
 
 	int rc;
 	if ((rc = pcs_poll_init(proc))) {
@@ -451,6 +491,11 @@ int pcs_process_init(struct pcs_process * proc)
 		return rc;
 	}
 
+	if ((rc = pcs_co_init_proc(proc))) {
+		pcs_log(LOG_ERR, "pcs_process: failed to initialize coroutines");
+		return rc;
+	}
+
 	return 0;
 }
 
@@ -459,6 +504,7 @@ static void pcs_fini_evloops(struct pcs_process *proc)
 	int i;
 	for (i = 0; i < proc->nr_evloops; i++) {
 		struct pcs_evloop *evloop = &proc->evloops[i];
+		pcs_co_fini_evloop(evloop);
 		BUG_ON(!cd_list_empty(&evloop->jobs));
 		fini_timers(&evloop->timers);
 	}
@@ -470,8 +516,8 @@ void pcs_process_fini(struct pcs_process * proc)
 
 	pcs_remote_fini(proc);
 	pcs_signal_fini(proc);
-	pcs_poll_fini(proc);
 	pcs_co_fini_proc(proc);
+	pcs_poll_fini(proc);
 
 	pcs_free(proc->evloops);
 
@@ -584,10 +630,10 @@ int pcs_process_oom_adjust(void)
 
 	/* In newer kernel versions "/proc/self/oom_adj" is deprecated,
 	 * need to use "/proc/self/oom_score_adj" instead */
-	int rc, fd = open(oom_score_adj, O_WRONLY);
+	int rc, fd = open(oom_score_adj, O_WRONLY | O_CLOEXEC);
 
 	if (fd < 0) {
-		fd = open(oom_adj, O_WRONLY);
+		fd = open(oom_adj, O_WRONLY | O_CLOEXEC);
 		if (fd < 0) {
 			pcs_log(LOG_ERR, "Unable open file %s - %s", oom_adj, strerror(errno));
 			return -1;

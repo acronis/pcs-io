@@ -30,6 +30,7 @@ struct pcs_context_val {
 #define PCS_CONTEXT_VAL_CLIENT	1
 #define PCS_CONTEXT_VAL_CONN	2
 #define PCS_CONTEXT_VAL_REQUEST	3
+#define PCS_CONTEXT_VAL_OT_SPAN	4
 #define PCS_CONTEXT_VAL_USER	1000
 	int		id;
 	void		*val;

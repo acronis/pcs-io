@@ -17,6 +17,10 @@
 #include <memory.h>
 #include <stdlib.h>
 
+#ifndef SOCK_CLOEXEC
+#define SOCK_CLOEXEC	0
+#endif
+
 #define sockconnect_from_ioconn(conn) container_of(conn, struct pcs_sockconnect, netconn.ioconn)
 
 static struct pcs_netconnect_tops netconn_tops;
@@ -135,7 +139,7 @@ void pcs_sockconnect_start(struct pcs_process * proc, struct pcs_sockconnect * s
 	int err;
 
 	while (1) {
-		fd = socket(sh->sa->sa_family, SOCK_STREAM, 0);
+		fd = socket(sh->sa->sa_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
 		if (!pcs_sock_invalid(fd))
 			break;
 

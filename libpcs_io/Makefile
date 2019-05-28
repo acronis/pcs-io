@@ -4,7 +4,7 @@ LIBPCS_IO=libpcs_io.so
 LIBOBJS=pcs_sock.o pcs_sock_conn.o pcs_sock_io.o pcs_sock_listen.o pcs_net_addr.o pcs_net_utils.o \
 	pcs_sock_ssl.o pcs_sock_ssl_st.o pcs_sock_ssl_mt.o \
 	pcs_process.o pcs_epoll.o pcs_kqueue.o pcs_sun_port.o pcs_event_ioconn.o pcs_ioconn.o \
-	pcs_compat.o pcs_aio.o pcs_sync_io.o pcs_sync_ioreq.o pcs_file_job.o \
+	pcs_compat.o pcs_aio.o pcs_sync_io.o pcs_sync_ioreq.o pcs_file_job.o pcs_atexit.o \
 	rbtree.o minheap.o timer.o log.o bug.o md5.o crc32.o crc32_sse.o crc32_arm_wrapper.o crc64.o adler32.o \
 	pcs_profiler.o pcs_watchdog.o logrotate.o pool_allocator.o pcs_config_file.o user.o \
 	pcs_signal.o pcs_random.o getopt_long.o \
@@ -12,7 +12,7 @@ LIBOBJS=pcs_sock.o pcs_sock_conn.o pcs_sock_io.o pcs_sock_listen.o pcs_net_addr.
 	lz4.o lz4_estimate.o parse_diskspace.o \
 	qselect.o regdump.o syslog.o pcs_shaper.o bufqueue.o pcs_upipe.o pcs_dir.o \
 	pcs_splice.o pcs_error.o ssl_helpers.o pcs_cpuid.o std_list.o pcs_context.o pcs_mr_malloc.o \
-	pcs_ucontext.o
+	pcs_ucontext.o pcs_exec.o
 LIBOBJS += $(if $(PCS_ENABLE_RDMA), pcs_rdma_conn.o pcs_rdma_listen.o pcs_rdma_io.o)
 LIBOBJS_ASM=crc32_neon.o
 
@@ -36,13 +36,12 @@ LDLIBS += $(if $(findstring Linux,$(UNAME)), -lunwind)
 ifdef PCS_TCMALLOC
 	LIBTCMALLOC += -Wl,-Bstatic -Wl,-whole-archive -ltcmalloc_minimal -Wl,-no-whole-archive -Wl,-Bdynamic -lstdc++
 endif
-LIBAIO=$(if $(findstring Linux,$(UNAME)),-laio)
 LIBRT=$(if $(findstring Linux,$(UNAME)),-lrt)
 
 all: $(LIBPCS_IO)
 
 $(LIBPCS_IO): $(LIBOBJS) $(LIBOBJS_ASM)
-	$(CC) $(LDFLAGS) -shared $(SONAME_FLAGS) -o $@.$(LIB_VER) $^ $(LIBTCMALLOC) $(LIBAIO) $(LIBRT)  $(LDLIBS) -lz
+	$(CC) $(LDFLAGS) -shared $(SONAME_FLAGS) -o $@.$(LIB_VER) $^ $(LIBTCMALLOC) $(LIBRT) $(LDLIBS) -lz
 	ln -sf $@.$(LIB_VER) $@.$(SONAME_MJ_VER)
 	ln -sf $@.$(LIB_VER) $@
 

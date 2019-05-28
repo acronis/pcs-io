@@ -11,34 +11,17 @@
 #include "pcs_co_io.h"
 #include "pcs_winapi.h"
 #include "bug.h"
+#include "log.h"
 #ifndef __WINDOWS__
 #include <unistd.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #endif
 #ifdef __MAC__
 #include <sys/syslimits.h>
-#endif
-
-#if defined(__linux__) && !__GLIBC_PREREQ(2, 4)
-
-#define AT_SYMLINK_NOFOLLOW 0x100
-
-#if defined(__i386__)
-#define SYS_fstatat 300
-#elif defined(__x86_64__)
-#define SYS_fstatat 262
-#else
-#error "unsupported architecture"
-#endif
-
-static inline int fstatat(int fd, const char *file, struct stat *st, int flag)
-{
-	return syscall(SYS_fstatat, fd, file, st, flag);
-}
-
 #endif
 
 #ifdef __WINDOWS__
@@ -126,6 +109,11 @@ __must_check int pcs_dirent_first(const char *path, u32 flags, pcs_dirent_t **ou
 	return rc;
 }
 
+__must_check int pcs_dirent_firstat(pcs_fd_t dirfd, const char *pathname, u32 flags, pcs_dirent_t **out_dir)
+{
+	BUG(); // not implemented for Windows
+}
+
 static __must_check int __dirent_next(struct pcs_dirent_priv *dir)
 {
 	pcs_free(dir->dirent.name);
@@ -160,10 +148,16 @@ static __must_check int __dirent_next(struct pcs_dirent_priv *dir)
 				name = ((FILE_ID_FULL_DIR_INFORMATION *)info)->FileName;
 				ino = ((FILE_ID_FULL_DIR_INFORMATION *)info)->FileId.QuadPart;
 				break;
+
+			default:
+				BUG();
 		}
 
 		u32 name_len = info->FileNameLength / sizeof(WCHAR);
 		if ((name_len == 1 && name[0] == '.') || (name_len == 2 && name[0] == '.' && name[1] == '.'))
+			continue;
+
+		if (name_len == 0)
 			continue;
 
 		dir->dirent.name = pcs_utf16_to_utf8(name, name_len);
@@ -236,12 +230,12 @@ static int _co_sync_dirent_first(void *arg)
 	return pcs_dirent_first(req->path, req->flags, &req->out_dir);
 }
 
-/* 
-pcs_co_dirent_next() is made compatible with pcs_dirent_t returned by pcs_dirent_first() 
+/*
+pcs_co_dirent_next() is made compatible with pcs_dirent_t returned by pcs_dirent_first()
 on _Windows_
 
-This is done to make possible to call pcs_dirent_first() from impersonated thread 
-and then later use generic pcs_co_dirent_next() for subsequent invocations using 
+This is done to make possible to call pcs_dirent_first() from impersonated thread
+and then later use generic pcs_co_dirent_next() for subsequent invocations using
 the same pcs_dirent_t instance.
 
 NB! Linux and Mac iterators are not affected by this change and should not be mixed.
@@ -254,6 +248,11 @@ __must_check int pcs_co_dirent_first(const char *path, u32 flags, pcs_dirent_t *
 	if (rc >= 0)
 		*out_dir = req.out_dir;
 	return rc;
+}
+
+__must_check int pcs_co_dirent_firstat(pcs_fd_t dirfd, const char *path, u32 flags, pcs_dirent_t **out_dir)
+{
+	BUG(); // not implemented for Windows
 }
 
 static int _co_sync_dirent_next(void *dir)
@@ -298,26 +297,91 @@ struct pcs_dirent_priv {
 	u32			flags;
 };
 
-__must_check int pcs_dirent_first(const char *path, u32 flags, pcs_dirent_t **out_dir)
+static __must_check int __dirent_first(DIR* dir, u32 flags, pcs_dirent_t **out_dir)
 {
 	int err;
-	struct pcs_dirent_priv *dir = pcs_xzmalloc(sizeof(*dir));
+	struct pcs_dirent_priv *dirent = pcs_xzmalloc(sizeof(*dirent));
 
-	dir->flags = flags;
-	dir->dir = opendir(path);
-	if (!dir->dir) {
-		err = -errno;
-		pcs_free(dir);
+	dirent->flags = flags;
+	dirent->dir = dir;
+
+	if ((err = pcs_dirent_next(&dirent->dirent)) < 0) {
+		pcs_dirent_close(&dirent->dirent);
 		return err;
 	}
 
-	if ((err = pcs_dirent_next(&dir->dirent)) < 0) {
-		pcs_dirent_close(&dir->dirent);
-		return err;
-	}
-
-	*out_dir = &dir->dirent;
+	*out_dir = &dirent->dirent;
 	return err;
+}
+
+__must_check int pcs_dirent_first(const char *path, u32 flags, pcs_dirent_t **out_dir)
+{
+	DIR *dir = opendir(path);
+	if (!dir)
+		return -errno;
+	return __dirent_first(dir, flags, out_dir);
+}
+
+#if defined(__linux__) && !__GLIBC_PREREQ(2, 4)
+#define USE_OPENAT_EMULATION
+
+typedef DIR *(*fdopendir_t)(int fd);
+
+static pthread_once_t _fdopendir_once = PTHREAD_ONCE_INIT;
+static fdopendir_t _fdopendir_func = NULL;
+
+static void _fdopendir_init(void)
+{
+	static const char func_name[] = "fdopendir";
+	void* sym = dlsym(RTLD_DEFAULT, func_name);
+	if (!sym) {
+		pcs_log(LOG_TRACE, "'%s' not found in glibc. Cause: %s.", func_name, dlerror());
+		return;
+	}
+	_fdopendir_func = (fdopendir_t)sym;
+}
+
+static DIR *fdopendir(pcs_fd_t fd)
+{
+	BUG_ON(fd < 0);
+	return _fdopendir_func(fd);
+}
+
+static inline int _fdopendir_available(void)
+{
+	pthread_once(&_fdopendir_once, _fdopendir_init);
+	return _fdopendir_func != NULL;
+}
+#endif /* defined(__linux__) && !__GLIBC_PREREQ(2, 4) */
+
+__must_check int pcs_dirent_firstat(pcs_fd_t dirfd, const char *pathname, u32 flags, pcs_dirent_t **out_dir)
+{
+	int rc;
+	DIR *dir = NULL;
+#ifdef USE_OPENAT_EMULATION
+	if (!_fdopendir_available()) {
+		char *path = pcs_pathat(dirfd, pathname);
+		dir = opendir(path);
+		rc = dir ? 0 : -errno;
+		pcs_free(path);
+		if (!dir)
+			return rc;
+
+		return __dirent_first(dir, flags, out_dir);
+	}
+#endif /* USE_OPENAT_EMULATION */
+	pcs_fd_t fd = PCS_INVALID_FD;
+	const int openat_flags = O_RDONLY | O_CLOEXEC | O_DIRECTORY;
+	if ((rc = pcs_sync_openat(dirfd, pathname, openat_flags, 0, &fd)))
+		return rc;
+	dir = fdopendir(fd);
+	if (!dir) {
+		rc = -errno;
+		pcs_sync_close(fd);
+		return rc;
+	}
+
+	return __dirent_first(dir, flags, out_dir);
 }
 
 __must_check int pcs_dirent_next(pcs_dirent_t *dirent)
@@ -334,14 +398,13 @@ __must_check int pcs_dirent_next(pcs_dirent_t *dirent)
 			continue;
 
 		if (dir->flags & PCS_DIRENT_STAT) {
-			struct stat st;
-			if (fstatat(dirfd(dir->dir), entry->d_name, &st, AT_SYMLINK_NOFOLLOW) < 0) {
-				if (errno == ENOENT)
+			int rc;
+			if ((rc = pcs_sync_fstatat(dirfd(dir->dir), entry->d_name, &dir->dirent.stat))) {
+				if (-rc == ENOENT)
 					continue;
 				dir->dirent.name = NULL;
-				return -errno;
+				return rc;
 			}
-			pcs_stat2pcs(&st, &dir->dirent.stat);
 		} else {
 #ifndef __SUN__
 			dir->dirent.stat.mode = DTTOIF(entry->d_type);
@@ -399,6 +462,7 @@ static int _co_sync_dirent_next(void *arg)
 }
 
 struct _co_req_dirent_first {
+	int			dirfd;
 	const char		*path;
 	u32			flags;
 	pcs_dirent_t		**out_dir;
@@ -409,7 +473,9 @@ static int _co_sync_dirent_first(void *arg)
 	struct _co_req_dirent_first *req = arg;
 	struct pcs_dirent_cached *dir = pcs_xmalloc(sizeof(*dir));
 
-	int r = pcs_dirent_first(req->path, req->flags, &dir->original);
+	int r = req->dirfd == PCS_INVALID_FD ?
+			pcs_dirent_first(req->path, req->flags, &dir->original) :
+			pcs_dirent_firstat(req->dirfd, req->path, req->flags, &dir->original);
 	if (r < 0) {
 		pcs_free(dir);
 		return r;
@@ -436,7 +502,13 @@ static int _co_sync_dirent_first(void *arg)
 
 __must_check int pcs_co_dirent_first(const char *path, u32 flags, pcs_dirent_t **out_dir)
 {
+	return pcs_co_dirent_firstat(PCS_INVALID_FD, path, flags, out_dir);
+}
+
+__must_check int pcs_co_dirent_firstat(pcs_fd_t dirfd, const char *path, u32 flags, pcs_dirent_t **out_dir)
+{
 	struct _co_req_dirent_first req = {
+		.dirfd = dirfd,
 		.path = path,
 		.flags = flags,
 		.out_dir = out_dir,

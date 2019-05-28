@@ -20,8 +20,8 @@
 
 /* per connection */
 #define RIO_N_RXS (RIO_QUEUE_DEPTH * 2 + 2)
-#define RIO_N_TXS (RIO_QUEUE_DEPTH + 2)
-/* NB: change RIO_N_RXS to (RIO_QUEUE_DEPTH * 2 + 2) as soon as we start sending ACK-s */
+/* RIO_QUEUE_DEPTH from us + up to RIO_QUEUE_DEPTH as answers to large RX. */
+#define RIO_N_TXS (RIO_QUEUE_DEPTH * 2 + 2)
 
 /* per rdma device */
 #define RIO_N_TXS_PER_DEV 2000

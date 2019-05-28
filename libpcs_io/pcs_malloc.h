@@ -12,6 +12,9 @@
 #include <stdlib.h>	/* include stdlib before poisoning malloc/free - won't be includable later */
 #include <stdarg.h>
 #include <string.h>
+#ifdef __MAC__
+#include <unistd.h>	/* uses valloc() */
+#endif
 
 #if !defined(__GNUC__) && !defined(__clang__)
 /* if we can't use GCC ({ }) construction, then have to lookup malloc info each time using hash table */
@@ -123,15 +126,20 @@ void pcs_malloc_failed(const char *file);
 PCS_API void pcs_malloc_debug_enable(void);
 
 #if (defined(__GNUC__) || defined(__clang__)) && !defined(PCS_MALLOC_POISON_DISABLE)
-#undef strndup
-#undef malloc
+#undef aligned_alloc
 #undef calloc
-#undef realloc
 #undef free
+#undef malloc
+#undef memalign
+#undef posix_memalign
+#undef pvalloc
+#undef realloc
+#undef reallocarray
 #undef strdup
 #undef strndup
-#undef posix_memalign
-#pragma GCC poison malloc calloc realloc free memalign posix_memalign strdup strndup pcs_memalign
+#undef valloc
+#pragma GCC poison aligned_alloc calloc free malloc memalign posix_memalign
+#pragma GCC poison pvalloc realloc reallocarray strdup strndup valloc
 #endif
 
 #endif /* __PCS_MALLOC_H__ */

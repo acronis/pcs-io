@@ -74,6 +74,29 @@ PCS_API int pcs_ssl_socket_set_cert(struct pcs_co_file *sock, X509 *cert, EVP_PK
 PCS_API int pcs_ssl_socket_set_server_name_indication(struct pcs_co_file *sock, const char *value);
 
 /**
+   Should be used from ClientHello callback (see
+   pcs_ssl_socket_set_client_hello_cb()). @value must be freed by user.
+ */
+PCS_API int pcs_ssl_socket_get_server_name_indication(struct pcs_co_file *sock, char **value);
+
+/**
+   ClientHello callback is needed to support custom SSL socket configuration depending
+   on SNI, that arrives in ClientHello, on server side.
+   How to use this function:
+   - create a new ssl socket,
+   - set ClientHello callback with pcs_ssl_socket_set_client_hello_cb(),
+   - do pcs_ssl_socket_co_accept(),
+   - from ClientHello callback, parse server name (SNI) from ClientHello, and set
+     appropriate server certificate and private key with pcs_ssl_socket_set_cert(),
+     and configure peer verirfication with pcs_ssl_socket_set_verify_peer().
+ */
+PCS_API void pcs_ssl_socket_set_client_hello_cb(struct pcs_co_file *file, int (*cb)(void *arg, SSL *ssl, int *alert), void *arg);
+#if OPENSSL_VERSION_NUMBER < 0x10101000
+#	define SSL_CLIENT_HELLO_SUCCESS 1
+#	define SSL_CLIENT_HELLO_ERROR 0
+#endif
+
+/**
    Require that a peer send a certificate during the handshake, and verify that certificate
    against a chain of trust provided by @get_certs.
 
@@ -90,7 +113,7 @@ PCS_API int pcs_ssl_socket_set_server_name_indication(struct pcs_co_file *sock, 
             any other error that @get_certs may return
  */
 PCS_API int pcs_ssl_socket_set_verify_peer(struct pcs_co_file *sock, unsigned int depth,
-		int (*get_certs)(struct pcs_co_file *sock, X509 ***certs, X509_CRL ***crls), u8 require_peer_cert);
+		int (*get_certs)(void *arg, X509 ***certs, X509_CRL ***crls), void *arg, u8 require_peer_cert);
 
 /**
    Install a function that will be callled after the verification of the peer certificate.

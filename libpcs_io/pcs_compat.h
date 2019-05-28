@@ -105,6 +105,23 @@ PCS_API unsigned int pcs_nr_processors(void);
 PCS_API unsigned int pcs_sys_page_size(void);
 PCS_API u64 pcs_phys_memory_size(void);
 
+#ifndef __LINUX__
+struct fiemap_extent {
+	u64	fe_logical;
+	u64	fe_physical;
+	u64	fe_length;
+	u32	fe_flags;
+};
+
+struct fiemap {
+	u32			fm_mapped_extents;
+	struct fiemap_extent	fm_extents[0];
+};
+
+#define FIEMAP_EXTENT_DELALLOC		0x00000004
+#define FIEMAP_EXTENT_UNWRITTEN		0x00000800
+#endif /* __LINUX__ */
+
 #ifdef __WINDOWS__
 PCS_API int fsync(int fd);
 PCS_API int ftruncate(int fd, u64 len);

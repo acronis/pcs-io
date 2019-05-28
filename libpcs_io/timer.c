@@ -259,6 +259,7 @@ static void __del_timer(struct pcs_timer *timer, struct pcs_timer_tree *timers)
 static void __set_timer_evloop(struct pcs_timer *timer, struct pcs_evloop *evloop)
 {
 	pcs_wmb();
+	__tsan_release(timer);
 	pcs_atomic_ptr_store(&timer->evloop, evloop);
 }
 
@@ -299,6 +300,8 @@ restart:;
 			evloop = actual_evloop;
 			continue;
 		}
+
+		__tsan_acquire(timer);
 
 		if (likely(evloop == this_evloop) || unlikely(evloop->timers.exec_timer == timer)) {
 			/* If timer function is running in another eventloop,
@@ -346,6 +349,8 @@ void del_timer_sync(struct pcs_timer *timer)
 			pthread_mutex_lock(&evloop->timers.lock);
 			continue;
 		}
+
+		__tsan_acquire(timer);
 
 		if (likely(evloop->timers.exec_timer != timer)) {
 			__del_timer(timer, &evloop->timers);

@@ -698,8 +698,9 @@ void pcs_co_write_unlock(struct pcs_co_rwlock *lock)
 
 	pthread_mutex_t *mtx = lock_static_mtx(lock);
 
+	struct wait_item *w;
 	if (!cd_list_empty(&lock->wwaiters)) {
-		struct wait_item *w = cd_list_first_entry(&lock->wwaiters, struct wait_item, lst);
+		w = cd_list_first_entry(&lock->wwaiters, struct wait_item, lst);
 		cd_list_del_init(&w->lst);
 
 		/* Transition D->B or D->D */
@@ -710,7 +711,6 @@ void pcs_co_write_unlock(struct pcs_co_rwlock *lock)
 	}
 
 	ULONG_PTR nr_rwaiters = 0;
-	struct wait_item *w;
 	cd_list_for_each_entry(struct wait_item, w, &lock->rwaiters, lst)
 		nr_rwaiters++;
 	BUG_ON(!nr_rwaiters);
@@ -720,7 +720,7 @@ void pcs_co_write_unlock(struct pcs_co_rwlock *lock)
 	BUG_ON(res != val);
 
 	while (!cd_list_empty(&lock->rwaiters)) {
-		struct wait_item *w = cd_list_first_entry(&lock->rwaiters, struct wait_item, lst);
+		w = cd_list_first_entry(&lock->rwaiters, struct wait_item, lst);
 		cd_list_del_init(&w->lst);
 		pcs_co_event_signal(w->event);
 	}

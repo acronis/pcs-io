@@ -12,6 +12,7 @@
 #include "pcs_profiler.h"
 #include "log.h"
 #include "logrotate.h"
+#include "bufqueue.h"
 #include "crc32.h"
 
 #include <stdio.h>
@@ -20,11 +21,6 @@
 
 /* Log level and formatting global flags */
 int __pcs_log_level = LOG_LEVEL_DEFAULT;
-#ifdef HAVE_TLS_STATIC
-static __thread int __log_indent;
-#else
-static int __log_indent;
-#endif
 
 #define VERSION_LIST_MAX 8
 static int version_nr;
@@ -46,6 +42,8 @@ static const char * version_list[VERSION_LIST_MAX];
 LPTOP_LEVEL_EXCEPTION_FILTER old_fatal_handler = NULL;
 #else /* __WINDOWS__ */
 #include <sys/time.h>
+#include <sys/wait.h>
+#include <spawn.h>
 #include <unistd.h>
 #endif /* __WINDOWS__ */
 #ifdef PCS_ADDR_SANIT
@@ -57,6 +55,7 @@ LPTOP_LEVEL_EXCEPTION_FILTER old_fatal_handler = NULL;
 #include "pcs_malloc.h"
 #include "pcs_sync_io.h"
 #include "pcs_sock.h"	/* for struct timeval on Windows */
+#include "pcs_atexit.h"
 #include "regdump.h"
 #include "timer.h"
 
@@ -75,7 +74,7 @@ LPTOP_LEVEL_EXCEPTION_FILTER old_fatal_handler = NULL;
 struct zst_wrap {
 	char msg[ZSTD_ERR_MSG_MAX];
 	void *compress_buff;
-	int compress_buff_size;
+	size_t compress_buff_size;
 };
 #endif
 
@@ -89,8 +88,6 @@ struct zst_wrap {
 #define LOG_BUFF_SZ		0x100000
 #define LOG_BUFF_RESERVE	0x10000
 #define LOG_BUFF_THRESHOLD	(LOG_BUFF_SZ-LOG_BUFF_RESERVE)
-#define LOG_BUFF_NEXT(Ind)	(((Ind) + 1) % 2)
-#define LOG_BUFF_PREV(Ind)	LOG_BUFF_NEXT(Ind)
 
 #define __str(s) #s
 #define __xstr(s) __str(s)
@@ -103,25 +100,32 @@ struct zst_wrap {
 	} while (0)
 #define ARRAY_SIZE(a)  (sizeof(a) / sizeof(*(a)))
 
+#if defined(__LINUX__) && __GLIBC_PREREQ(2, 4) && defined(_POSIX_MONOTONIC_CLOCK) && (_POSIX_MONOTONIC_CLOCK >= 0)
+#define USE_MONOTONIC_CLOCK
+#endif
+
 const char log_level_names[] = {'E', 'W', 'I', 'T', 'T', 'T', 'T', 'D', 'D'};
 BUILD_BUG_ON(ARRAY_SIZE(log_level_names) != LOG_LEVEL_MAX);
 
 struct log_buff {
 	char		buff[LOG_BUFF_SZ];
 
-	unsigned	used;	/* The number of used bytes */
-	unsigned	full;	/* Set to the number of bytes if writing is pending */
+	size_t	used;	/* The number of used bytes */
+	size_t	full;	/* Set to the number of bytes if writing is pending */
 };
 
 struct log_writer {
 	/* The current filename */
 	char*		fname;
-	int             lflags; 
+	int             lflags;
 
 	/* The lock file descriptor */
 	pcs_fd_t	lock_fd;
 	/* The file descriptor */
-	pcs_fd_t	fd;
+	union {
+		int	fd;
+		pcs_fd_t fh;
+	};
 #ifdef _ENABLE_GZIP_COMPRESSION
 	gzFile		gz_file;
 #endif
@@ -144,7 +148,8 @@ struct log_writer {
 	/* The double buffering stuff */
 	int		curr;	/* Current buffer index */
 	int		written;/* Last written buffer index */
-	struct log_buff	b[2];
+	struct log_buff	* b;	/* The array of log buffers */
+	unsigned	nb;	/* The number of log buffers allocated */
 
 	int (*open_log)(struct log_writer* l);
 	void (*write_buff)(struct log_writer* l, struct log_buff* b);
@@ -154,10 +159,8 @@ struct log_writer {
 	struct logrotate	rotate;
 };
 
-/* Set after client placed message with LOG_NONL flag. It indicates the client intention to continue writing
- * the log in single line. It also prevents flushing the log content. Not quite thread safe but simple enough.
- */
-static int log_nonl;
+/* The number of log buffers */
+static int log_nbuffers = 2;
 
 /* Log writer context. The context is not allocated in case of the default stderr logging.
  * The log rotation is disabled in such case as well.
@@ -165,7 +168,29 @@ static int log_nonl;
 static struct log_writer* logwriter;
 
 /* Supported extentions for log rotation */
-const char *log_exts[] = { ".gz", ".zst", ".log", ".blog", "", NULL };
+const char *log_exts[] = { ".gz", ".zst", ".blog", "", NULL };
+
+static void log_atexit_cb(struct pcs_atexit_hook const* h)
+{
+	pcs_log_terminate();
+}
+
+/* Atexit hook for graceful log termination */
+struct pcs_atexit_hook log_atexit_hook = {.cb = log_atexit_cb};
+
+static inline int log_buff_next(struct log_writer const* l, int i)
+{
+	if (++i >= l->nb)
+		i = 0;
+	return i;
+}
+
+static inline int log_buff_prev(struct log_writer const* l, int i)
+{
+	if (i <= 0)
+		i = l->nb;
+	return i - 1;
+}
 
 #ifdef __WINDOWS__
 struct tm *gmtime_r(const time_t *timep, struct tm *result)
@@ -188,7 +213,7 @@ struct tm *localtime_r(const time_t *timep, struct tm *result)
 /* Alternate log writer backend. When this function is set logwriter is not used.
  * The log rotation is disabled in such case as well.
  */
-static void (*log_handler)(int level, int indent, const char *prefix, const char *fmt, va_list va);
+static void (*log_handler)(int level, const char *buf, unsigned int len);
 
 static void init_ops_generic(struct log_writer* l);
 
@@ -197,7 +222,7 @@ static void write_log_header(struct log_writer *l);
 #if defined(_ENABLE_GZIP_COMPRESSION) || defined(_ENABLE_ZSTD_COMPRESSION)
 static struct z_funcs_s {
 	int (*open_existing)(int fd, u64 size, struct log_writer *log);
-	int (*dopen)(struct log_writer* l, pcs_fd_t fd);
+	int (*dopen)(struct log_writer* l, int fd);
 	int (*close)(struct log_writer* l);
 	int (*file_is_null)(struct log_writer* l);
 	int (*write)(struct log_writer* l, const void* buff, int len);
@@ -205,7 +230,7 @@ static struct z_funcs_s {
 	int (*puts)(struct log_writer* l, char *str);
 	void (*clear_err)(struct log_writer* l);
 	int (*flush)(struct log_writer* l);
-} z_funcs = {0};
+} z_funcs;
 #endif
 #ifdef _ENABLE_GZIP_COMPRESSION
 static void init_ops_gzip(struct log_writer* l);
@@ -216,11 +241,12 @@ static void init_ops_zstd(struct log_writer* l);
 
 /* The access to the log from the client threads will be serialized */
 static pthread_mutex_t loglock =
-#if defined(__linux__)
+#if defined(__LINUX__)
 	PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+#elif defined(__SUN__)
+	{{0, 0, 0, PTHREAD_PROCESS_PRIVATE | PTHREAD_MUTEX_RECURSIVE, _MUTEX_MAGIC}, {{{0}}}, 0};
 #else
-	/* FIXME: MacOS doesn't support recursive locking, so logging may hang somewhere below on catching of SIGSEGV etc. */
-	PTHREAD_MUTEX_INITIALIZER;
+	PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 #endif
 /* Prevent race between logger thread and fatal signal handler
  * for flushing the log */
@@ -232,55 +258,89 @@ static inline int log_writer_active(void)
 	return logwriter && !logwriter->close_request;
 }
 
-static inline abs_time_t lock_log(void)
+#if defined(PCS_RUN_DEBUG_TOOLS) && defined(__LINUX__)
+
+static void collect_perf(void)
 {
-	pthread_mutex_lock(&loglock);
-	if (log_writer_active())
-	{
-		/* If the current buffer is full wait for write completion */
-		if (logwriter->b[logwriter->curr].full) {
-			abs_time_t ts1;
+	static abs_time_t perf_ts;
+	abs_time_t t = get_abs_time_ms();
 
-			ts1 = get_abs_time_ms();
-			do
-				pthread_cond_wait(&logwriter->cond, &loglock);
-			while (logwriter->b[logwriter->curr].full);
-			return get_elapsed_time(get_abs_time_ms(), ts1);
-		}
-	}
+	/* don't collect perf too often */
+	if (t - perf_ts < 10*1000)
+		return;
+	perf_ts = t;
 
-	return 0;
+	/* check that perf is not running */
+	static int perf_pid;
+	if (perf_pid > 0 && waitpid(perf_pid, NULL, WNOHANG) == 0)
+		return;
+
+	perf_pid = 0;
+
+	/* run: vstorage-perf logger <pid> */
+	char pid_str[12];
+	snprintf(pid_str, sizeof(pid_str), "%d", getpid());
+	char *argv[] = {
+		"/usr/bin/vstorage-perf",
+		"logger",
+		pid_str,
+		NULL
+	};
+
+	posix_spawn_file_actions_t file_actions;
+	BUG_ON(posix_spawn_file_actions_init(&file_actions));
+	BUG_ON(posix_spawn_file_actions_addopen(&file_actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0));
+	BUG_ON(posix_spawn_file_actions_addopen(&file_actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0));
+	BUG_ON(posix_spawn_file_actions_addopen(&file_actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0));
+	posix_spawnattr_t spawn_attr;
+	BUG_ON(posix_spawnattr_init(&spawn_attr));
+	BUG_ON(posix_spawnattr_setflags(&spawn_attr, POSIX_SPAWN_USEVFORK));
+	posix_spawn(&perf_pid, argv[0], &file_actions, &spawn_attr, argv, environ);
+	posix_spawnattr_destroy(&spawn_attr);
+	posix_spawn_file_actions_destroy(&file_actions);
 }
 
-static inline void unlock_log(void)
+static void lock_log_wait(void)
 {
-	if (!log_nonl)
-	{
-		/* Flush log */
-		if (log_writer_active())
-		{
-			struct log_buff* b = &logwriter->b[logwriter->curr];
-			BUG_ON(b->full);
-			if (b->used >= LOG_BUFF_THRESHOLD) {
-				/* If filled switch current buffer and wake up writer */
-				b->full = b->used;
-				logwriter->curr = LOG_BUFF_NEXT(logwriter->curr);
-				logwriter->b[logwriter->curr].used = 0;
-				pthread_cond_broadcast(&logwriter->cond);
-			}
-		} else
-			fflush(stderr);
-	}
-	pthread_mutex_unlock(&loglock);
+	int res;
+	struct timespec ts;
+
+	do {
+#ifdef USE_MONOTONIC_CLOCK
+		res = clock_gettime(CLOCK_MONOTONIC, &ts);
+		BUG_ON(res);
+#else
+		struct timeval tv;
+		gettimeofday(&tv, 0);
+		ts.tv_sec = tv.tv_sec;
+		ts.tv_nsec = tv.tv_usec * 1000;
+#endif
+		ts.tv_sec += 3;
+
+		res = pthread_cond_timedwait(&logwriter->cond, &loglock, &ts);
+		if (res == ETIMEDOUT)
+			collect_perf();
+	} while (logwriter->b[logwriter->curr].full);
 }
+
+#else /* PCS_RUN_DEBUG_TOOLS && __LINUX__ */
+
+static void lock_log_wait(void)
+{
+	do {
+		pthread_cond_wait(&logwriter->cond, &loglock);
+	} while (logwriter->b[logwriter->curr].full);
+}
+
+#endif /* PCS_RUN_DEBUG_TOOLS && __LINUX__ */
 
 /* posix file operations */
 static int log_file_open(const char *filename, int flag, int pmode)
 {
 #ifdef __WINDOWS__
-	return _open(filename, _O_BINARY | flag, pmode);
+	return _open(filename, flag | _O_BINARY, pmode);
 #else /* __WINDOWS__ */
-	return open(filename, flag, pmode);
+	return open(filename, flag | O_CLOEXEC, pmode);
 #endif /* __WINDOWS__ */
 }
 
@@ -314,13 +374,13 @@ static int log_file_close(int fd)
 }
 
 
-static int log_file_getsize(int fd, u64* size)
+static int log_file_getsize(int fd, long long* size)
 {
 #ifdef __WINDOWS__
 	struct _stat64 st;
 	if (_fstat64(fd, &st) < 0)
 		return -1;
-	*size = (u64)st.st_size;
+	*size = st.st_size;
 #else /* __WINDOWS__ */
 	struct stat st;
 	if (fstat(fd, &st) < 0)
@@ -334,8 +394,12 @@ static int log_file_dup(int fd)
 {
 #ifdef __WINDOWS__
 	return _dup(fd);
-#else /* __WINDOWS__ */
-	return dup(fd);
+#elif defined(F_DUPFD_CLOEXEC)
+	return fcntl(fd, F_DUPFD_CLOEXEC, 0);
+#else
+	if ((fd = dup(fd)) >= 0)
+		fcntl(fd, F_SETFD, FD_CLOEXEC);
+	return fd;
 #endif /* __WINDOWS__ */
 }
 
@@ -373,16 +437,6 @@ static s32 log_file_read(int fd, void* buff, u32 count)
 #endif /* __WINDOWS__ */
 }
 
-static void __noreturn pcs_abort(void)
-{
-	pcs_log_terminate();
-
-	/* block profiler signals to avoid truncated core dumps */
-	pcs_profiler_block(NULL, NULL);
-
-	abort();
-}
-
 /* ----------------------------------------------------------------------------------------------------
  * The core time formatting routines
  * ---------------------------------------------------------------------------------------------------- */
@@ -401,27 +455,27 @@ int __pcs_log_format_time_std(abs_time_t ts, char* buf, unsigned sz, char *saved
 	time_t sec = ts / 1000;
 	struct tm tm;
 
-	if (sz < STD_TIME_LEN + 4 /* for milliseconds */ + 1 /* \0 */) pcs_abort(); // don't use BUG_ON - recursion
+	if (sz < STD_TIME_LEN + 4 /* for milliseconds */ + 1 /* \0 */) abort(); // don't use BUG_ON - recursion
 
 	if (saved_time_buf && current_sec)
 	{
 		if (sec != *current_sec) {
 			*current_sec = sec;
-			if (!localtime_r(&sec, &tm)) pcs_abort(); // don't use BUG_ON - recursion
+			if (!localtime_r(&sec, &tm)) abort(); // don't use BUG_ON - recursion
 			size_t len = strftime(saved_time_buf, sz, STD_TIME_FMT, &tm);
-			if (len != STD_TIME_LEN) pcs_abort(); // don't use BUG_ON - recursion
+			if (len != STD_TIME_LEN) abort(); // don't use BUG_ON - recursion
 		}
 		memcpy(buf, saved_time_buf, STD_TIME_LEN);
 	} else {
-		if (!localtime_r(&sec, &tm)) pcs_abort(); // don't use BUG_ON - recursion
+		if (!localtime_r(&sec, &tm)) abort(); // don't use BUG_ON - recursion
 		size_t len = strftime(buf, sz, STD_TIME_FMT, &tm);
-		if (len != STD_TIME_LEN) pcs_abort(); // don't use BUG_ON - recursion
+		if (len != STD_TIME_LEN) abort(); // don't use BUG_ON - recursion
 	}
 
 	abs_time_t msec = ts - sec * 1000ULL;
 	buf += STD_TIME_LEN;
 	*buf++ = '.';
-	*buf++ = '0' + msec / 100;
+	*buf++ = '0' + msec / 100 % 10;
 	*buf++ = '0' + (msec / 10) % 10;
 	*buf++ = '0' + msec % 10;
 	*buf++ = 0;
@@ -443,10 +497,10 @@ int __pcs_log_format_time_compact(abs_time_t ts, char* buf, unsigned sz)
 	struct tm tm;
 
 	/* Shouldn't fail, ts_sec must be valid always */
-	if (!gmtime_r(&ts_sec, &tm)) pcs_abort(); // don't use BUG_ON - recursion
+	if (!gmtime_r(&ts_sec, &tm)) abort(); // don't use BUG_ON - recursion
 
 	size_t len = strftime(buf, sz, COMPACT_TIME_FMT, &tm);
-	if (len != COMPACT_TIME_LEN) pcs_abort(); // don't use BUG_ON - recursion
+	if (len != COMPACT_TIME_LEN) abort(); // don't use BUG_ON - recursion
 	return COMPACT_TIME_LEN;
 }
 
@@ -465,35 +519,29 @@ char * format_filename_ts(const char *basename, const char *ext, unsigned long i
  * The core log output routines
  * ---------------------------------------------------------------------------------------------------- */
 
-static void __log_vprintf_stdfile(FILE *f, int level, const char *prefix, const char *fmt, va_list va)
+static void __log_print_stdfile(FILE *f, int level, const char *buf, size_t len)
 {
 	if (!(level & LOG_NOTS)) {
 		char ts[32];
 		static char last_time_buff[32];
 		static time_t last_second = 0;
-		__pcs_log_format_time_std(get_real_time_ms(), ts, sizeof(ts), last_time_buff, &last_second);
-		fprintf(f, "%s ", ts);
+		int ts_len = __pcs_log_format_time_std(get_real_time_ms(), ts, sizeof(ts), last_time_buff, &last_second);
+		fwrite(ts, 1, ts_len, f);
+		putc(' ', f);
 	}
 
-	if (prefix) {
-		fprintf(f, "%s: ", prefix);
-	}
-	if (fmt) {
-		vfprintf(f, fmt, va);
-	}
-	if (!(level & LOG_NONL)) {
-		fputs("\n", f);
-	}
+	fwrite(buf, 1, len, f);
+	putc('\n', f);
 }
 
-static void __log_vprintf_buf(int level, const char *prefix, const char *fmt, va_list va)
+static void __log_print_buf(int level, const char *buf, size_t len)
 {
 	/* Consider current buffer */
 	struct log_buff *b = &logwriter->b[logwriter->curr];
-	int sz = LOG_BUFF_SZ - b->used - 32 /* max timestamp */ - 1 /* log level */ - 1 /* space */ - 64 /* max prefix */ - 48 /* max indent */ - 1 /* \n */;
-	if (b->full || sz < 0) {
+	static const char msg_too_long[] = "!!! LOG MESSAGE TOO LONG";
+	if (b->full || LOG_BUFF_SZ - b->used < 32 /* max timestamp */ + 1 /* log level */ + 1 /* space */ + sizeof(msg_too_long)) {
 		/* NOTE: these functions should not use BUG_ON, recursive loop is possible as BUG_ON will call us again. */
-		pcs_abort();
+		abort();
 	}
 
 	if (!(level & LOG_NOTS)) {
@@ -502,92 +550,73 @@ static void __log_vprintf_buf(int level, const char *prefix, const char *fmt, va
 		abs_time_t t = get_real_time_ms();
 		int ts_len;
 
-		if (!logwriter) pcs_abort(); // don't use BUG_ON - recursion
+		if (!logwriter) abort(); // don't use BUG_ON - recursion
 		ts_len = __pcs_log_format_time_std(t, &b->buff[b->used], 32, last_time_buff, &last_second);
 
 		b->used += ts_len;
 		b->buff[b->used++] = ' ';
 	}
 
-	/* LOG_NOTS actually means that previous print was with LOG_NONL */
 	if (!(level & LOG_NOTS) && logwriter->lflags & PCS_LOG_PRINT_LEVEL) {
 		int name_idx = (level & LOG_LEVEL_MASK) > LOG_LEVEL_MAX ? LOG_LEVEL_MAX : level & LOG_LEVEL_MASK;
 		b->buff[b->used++] = log_level_names[name_idx];
 		b->buff[b->used++] = ' ';
 	}
 
-	if (__log_indent && !(level & LOG_NOIND)) {
-		const char indent[] = "                                                ";
-		int len = __log_indent < sizeof(indent) ? __log_indent : sizeof(indent) - 1;
-		memcpy(&b->buff[b->used], indent, len);
-		b->used += len;
+	if (len > LOG_BUFF_SZ - b->used) {
+		buf = msg_too_long;
+		len = sizeof(msg_too_long) - 1;
 	}
 
-	if (prefix) {
-		size_t len = strlen(prefix);
-		len = len < 64 ? len : 64;
-		memcpy(&b->buff[b->used], prefix, len);
-		b->used += len;
-		b->buff[b->used++] = ':';
-		b->buff[b->used++] = ' ';
-	}
+	memcpy(&b->buff[b->used], buf, len);
+	b->used += len;
 
-	if (fmt) {
-		/* Output to the buffer */
-		int res = vsnprintf(&b->buff[b->used], sz, fmt, va);
-		if (res < 0) {
-			/* Output error */
-			res = snprintf(&b->buff[b->used], sz, "!!! LOG FORMAT ERROR: %s\n", fmt);
-		}
-		else if (res > sz) {
-			/* Output is truncated. It means that the client is writing
-			 * more than LOG_BUFF_RESERVE in single log line.
-			 */
-			res = snprintf(&b->buff[b->used], sz, "!!! LOG MESSAGE TOO LONG: %s\n", fmt);
-		}
-		if (res < 0) {
-			res = 0;
-		} else if (res > sz) {
-			res = sz;
-		}
-		/* Update used buffer space */
-		b->used += res;
-	}
-
-	if (!(level & LOG_NONL)) {
-		b->buff[b->used++] = '\n';
-	}
+	b->buff[b->used++] = '\n';
 }
 
-static void log_vprintf_lvl(int level, const char *prefix, const char *fmt, va_list va)
+static void log_print_buf_locked(int level, const char *buf, size_t len)
 {
-	/* special case when handler set - its duty is to print TS, prefix/indent */
-	if (log_handler) {
-		log_handler(level, (level & LOG_NOIND) ? 0 : __log_indent, prefix, fmt, va);
-		return;
-	}
-
 	if ((level & LOG_STDOUT) == LOG_STDOUT) {
-		__log_vprintf_stdfile(stdout, level, prefix, fmt, va);
+		__log_print_stdfile(stdout, level, buf, len);
 		return;
 	}
 
 	/* Just redirect to stderr if file writer is not allocated or already terminating*/
 	if (!log_writer_active()) {
-		__log_vprintf_stdfile(stderr, level, prefix, fmt, va);
+		__log_print_stdfile(stderr, level, buf, len);
 		return;
 	}
 
-	__log_vprintf_buf(level, prefix, fmt, va);
+	__log_print_buf(level, buf, len);
 }
 
+#define log_printf(fmt, ...) __log_printf(NULL, fmt, ##__VA_ARGS__)
+
 /* log_printf should be used under log lock or in extreme cases (crash). unlike printf, it adds \n at the end. */
-static void log_printf(const char *fmt, ...)
+static void __log_printf(void *arg, const char *fmt, ...)
 {
+	char buf[1024];
 	va_list va;
 	va_start(va, fmt);
-	log_vprintf_lvl(LOG_ERR, NULL, fmt, va);
+	int len = vsnprintf(buf, sizeof(buf), fmt, va);
 	va_end(va);
+
+	if (len < 0)
+		abort(); // don't use BUG_ON - recursion
+
+	if (len >= sizeof(buf))
+		len = (int)strlen(buf);
+
+	if (len && buf[len - 1] == '\n')
+		len--;
+
+	/* special case when handler set - its duty is to print TS */
+	if (log_handler) {
+		log_handler(LOG_ERR, buf, len);
+		return;
+	}
+
+	log_print_buf_locked(LOG_ERR, buf, len);
 }
 
 /*
@@ -612,20 +641,20 @@ static int __open_log_file(struct log_writer* l)
 		pcs_sync_close(fd);
 		return -1;
 	}
-	l->fd = fd;
+	l->fh = fd;
 	l->log_size = size;
 	return 0;
 }
 
 static void __write_log_buff(struct log_writer* l, struct log_buff* b)
 {
-	int size = b->full;
+	size_t size = b->full;
 	BUG_ON(!size);
 	BUG_ON(size > LOG_BUFF_SZ);
-	if (pcs_sync_nwrite(l->fd, l->log_size, b->buff, size) == size) {
+	if (pcs_sync_nwrite(l->fh, l->log_size, b->buff, (int)size) == size) {
 		l->log_size += size;
 	} else {
-		fprintf(stderr, "failed to write %d bytes to %s : %s\n", size, l->fname, strerror(errno));
+		fprintf(stderr, "failed to write %d bytes to %s : %s\n", (int)size, l->fname, strerror(errno));
 		fflush(stderr);
 	}
 }
@@ -634,7 +663,7 @@ static void log_worker_write(struct log_writer* l)
 {
 	for (;;)
 	{
-		int next_buff = LOG_BUFF_NEXT(l->written);
+		int next_buff = log_buff_next(l, l->written);
 		struct log_buff* b = &l->b[next_buff];
 		if (!b->full)
 			return;
@@ -653,15 +682,15 @@ static void log_worker_write(struct log_writer* l)
 
 static void __log_worker_close(struct log_writer* l)
 {
-	int res = pcs_sync_close(l->fd);
+	int res = pcs_sync_close(l->fh);
 	if (res)
 		pcs_log(LOG_ERR, "failed to close log file %s : %s", l->fname, strerror(-res));
-	l->fd = (pcs_fd_t)(-1);
+	l->fh = PCS_INVALID_FD;
 }
 
 static int __log_worker_reopen(struct log_writer* l)
 {
-	pcs_fd_t fd = l->fd;
+	pcs_fd_t fd = l->fh;
 	int res = l->open_log(l);
 	if (res)
 		return -1;
@@ -702,11 +731,27 @@ void pcs_apply_log_files_limits(int nfiles, unsigned long long total_size, abs_t
 	logrotate_apply_limits(l->rotate.basename, nfiles, total_size, age_sec);
 }
 
-#define LOG_FLUSH_TOUT 5
+static inline int log_has_full_buff(struct log_writer* l)
+{
+	unsigned i;
+	for (i = 0; i < l->nb; ++i) {
+		if (l->b[i].full)
+			return 1;
+	}
+	return 0;
+}
 
-#if defined(__LINUX__) && __GLIBC_PREREQ(2, 4) && defined(_POSIX_MONOTONIC_CLOCK) && (_POSIX_MONOTONIC_CLOCK >= 0)
-#define USE_MONOTONIC_CLOCK
-#endif
+static inline unsigned log_full_buff_count(struct log_writer* l)
+{
+	unsigned i, cnt = 0;
+	for (i = 0; i < l->nb; ++i) {
+		if (l->b[i].full)
+			++cnt;
+	}
+	return cnt;
+}
+
+#define LOG_FLUSH_TOUT 5
 
 static pcs_thread_ret_t log_worker(void* arg)
 {
@@ -731,8 +776,9 @@ static pcs_thread_ret_t log_worker(void* arg)
 		for (;;)
 		{
 			/* Check wake up conditions */
-			if (l->b[0].full || l->b[1].full)
+			if (log_has_full_buff(l))
 				break;
+
 			if (l->rotate.request || l->close_request)
 				break;
 
@@ -744,7 +790,7 @@ static pcs_thread_ret_t log_worker(void* arg)
 		/* Flush buffer if necessary */
 		if (l->b[l->curr].used && !l->b[l->curr].full)
 		{
-			int next_buff = LOG_BUFF_NEXT(l->curr);
+			int next_buff = log_buff_next(l, l->curr);
 			/* Enforce current buffer flushing on close or reopen or if the timeout is expired and
 			 * we have the second buffer free (otherwise the client will block).
 			 */
@@ -779,10 +825,10 @@ static pcs_thread_ret_t log_worker(void* arg)
  */
 
 /* Fill provided buffer with buffered log tail or returns -1 if log is not buffered. */
-int pcs_log_get_tail(char* buff, unsigned* sz)
+int pcs_log_get_tail(char* buff, unsigned int* sz)
 {
 	struct log_buff *curr, *prev;
-	unsigned sz_curr, sz_left, sz_total = 0;
+	size_t sz_curr, sz_left, sz_total = 0;
 	if (!logwriter)
 		return -1;
 
@@ -795,7 +841,7 @@ int pcs_log_get_tail(char* buff, unsigned* sz)
 	if ((sz_curr = curr->used) <= (sz_left = *sz))
 	{
 		sz_left -= sz_curr;
-		prev = &logwriter->b[LOG_BUFF_PREV(logwriter->curr)];
+		prev = &logwriter->b[log_buff_prev(logwriter, logwriter->curr)];
 		if (prev->used <= sz_left)
 		{
 			memcpy(buff, prev->buff, prev->used);
@@ -816,12 +862,66 @@ int pcs_log_get_tail(char* buff, unsigned* sz)
 	pthread_mutex_unlock(&loglock);
 
 	BUG_ON(sz_total > *sz);
-	*sz = sz_total;
+	*sz = (unsigned int)sz_total;
 	return 0;
 }
 
+static inline void lock_log(void)
+{
+	pthread_mutex_lock(&loglock);
+	if (!log_writer_active())
+		return;
+
+	/* If the current buffer is full wait for write completion */
+	if (!logwriter->b[logwriter->curr].full)
+		return;
+
+	abs_time_t ts1, blocked_time;
+	ts1 = get_abs_time_us();
+	lock_log_wait();
+	if ((blocked_time = get_elapsed_time(get_abs_time_us(), ts1) / 1000)) {
+		log_printf("[log blocked for %llums (%u of %u buffers full)]\n",
+			blocked_time, log_full_buff_count(logwriter), logwriter->nb);
+	}
+}
+
+static inline void unlock_log(void)
+{
+	/* Flush log */
+	if (log_writer_active())
+	{
+		struct log_buff* b = &logwriter->b[logwriter->curr];
+		BUG_ON(b->full);
+		if (b->used >= LOG_BUFF_THRESHOLD) {
+			/* If filled switch current buffer and wake up writer */
+			b->full = b->used;
+			logwriter->curr = log_buff_next(logwriter, logwriter->curr);
+			logwriter->b[logwriter->curr].used = 0;
+			pthread_cond_broadcast(&logwriter->cond);
+		}
+	} else
+		fflush(stderr);
+	pthread_mutex_unlock(&loglock);
+}
+
+static void log_print_buf(int level, const char *buf, size_t len)
+{
+	if (len && buf[len - 1] == '\n')
+		len--;
+
+	/* special case when handler set - its duty is to print TS */
+	if (log_handler) {
+		log_handler(level, buf, (unsigned)len);
+		return;
+	}
+
+	lock_log();
+	log_print_buf_locked(level, buf, len);
+	unlock_log();
+}
+
 /* Prints the log message according to the following pattern:
- * [timestamp] [indentation] [prefix: ] message [\n]
+ * [timestamp] [prefix: ] message [\n]
  */
 void pcs_valog(int level, const char *prefix, const char *fmt, va_list va)
 {
@@ -831,29 +931,42 @@ void pcs_valog(int level, const char *prefix, const char *fmt, va_list va)
 	if (in_fatal_signal_handler)
 		return;
 
-	abs_time_t blocked_time = lock_log();
-
-	if (blocked_time) {
-		log_printf("[log blocked for %llums]\n", blocked_time);
+	char stack_buf[1024];
+	char *buf = stack_buf;
+	int prefix_len = prefix ? (int)strlen(prefix) + 2 : 0;
+	int len;
+	va_list va0;
+	va_copy(va0, va);
+	if (prefix_len < sizeof(stack_buf))
+		len = vsnprintf(stack_buf + prefix_len, sizeof(stack_buf) - prefix_len, fmt, va0);
+	else
+		len = vsnprintf(NULL, 0, fmt, va0);
+	va_end(va0);
+	BUG_ON(len < 0);	/* invalid format string */
+	len += prefix_len;
+	if (len >= sizeof(stack_buf)) {
+		int buf_sz = len + 1;
+		buf = pcs_xmalloc(buf_sz);
+		len = vsnprintf(buf + prefix_len, buf_sz - prefix_len, fmt, va);
+		BUG_ON(len < 0);
+		len += prefix_len;
+		BUG_ON(len >= buf_sz);
+	}
+	if (prefix) {
+		memcpy(buf, prefix, prefix_len - 2);
+		buf[prefix_len - 2] = ':';
+		buf[prefix_len - 1] = ' ';
 	}
 
-	log_vprintf_lvl(level | (log_nonl ? LOG_NOTS : 0), prefix, fmt, va);
+	log_print_buf(level, buf, len);
 
-	log_nonl = level & LOG_NONL;
-
-	unlock_log();
+	if (buf != stack_buf)
+		pcs_free(buf);
 }
 
 int *pcs_log_lvl(void)
 {
 	return &__pcs_log_level;
-}
-
-int *pcs_log_indent(void)
-{
-	/* On Windows thread variable cannot be exported by dll
-	 * See https://msdn.microsoft.com/en-us/library/40a45kxx.aspx */
-	return &__log_indent;
 }
 
 static void pcs_valog_exitmsg(const char *fmt, va_list va);
@@ -882,29 +995,32 @@ void pcs_trace(int level, const char* func, const char *fmt, ...)
 	va_end(va);
 }
 
-void pcs_log_hexdump(int level, const void *buf, int olen)
+void pcs_log_hexdump(int level, const void *buf, int olen, const char *prefix_fmt, ...)
 {
-	int len = olen > 64 ? 64 : olen;
-	char *str = 0, *p = 0;
-	int alloc_sz;
-	int i;
-
 	if ((level & LOG_LEVEL_MASK) > pcs_log_level)
 		return;
 
-	alloc_sz = len * 3 + 3 + 1;
-	str = (char*)pcs_xmalloc(alloc_sz);
-	p = str;
+	va_list va;
+	va_start(va, prefix_fmt);
+	int len = olen > 64 ? 64 : olen;
+	int alloc_sz = vsnprintf(NULL, 0, prefix_fmt, va);
+	BUG_ON(alloc_sz < 0);
+	alloc_sz += len * 3 + 3 + 1;
+	va_end(va);
+	va_start(va, prefix_fmt);
+	char *str = pcs_xmalloc(alloc_sz);
+	int pos = vsnprintf(str, alloc_sz, prefix_fmt, va);
+	BUG_ON(pos < 0);
+	va_end(va);
 
-	*p = 0;
+	int i;
 	for (i = 0; i < len; i++)
-		p += sprintf(p, "%02x ", *((unsigned char *)buf + i));
+		pos += snprintf(str + pos, alloc_sz - pos, "%02x ", *((unsigned char *)buf + i));
 	if (olen > len)
-		p += sprintf(p, "...");
-	BUG_ON(p > str + alloc_sz);
-	str[alloc_sz - 1] = 0;
+		pos += snprintf(str + pos, alloc_sz - pos, "...");
+	BUG_ON(pos >= alloc_sz);
 
-	pcs_log(level|LOG_NOIND, "%s", str);
+	pcs_log(level, "%s", str);
 	pcs_free(str);
 }
 
@@ -913,7 +1029,7 @@ void pcs_fatal(const char *fmt, ...)
 	va_list va;
 
 	va_start(va, fmt);
-	pcs_valog(LOG_ERR|LOG_NOIND, "Fatal", fmt, va);
+	pcs_valog(LOG_ERR, "Fatal", fmt, va);
 	va_end(va);
 	va_start(va, fmt);
 	pcs_valog_exitmsg(fmt, va);
@@ -921,30 +1037,37 @@ void pcs_fatal(const char *fmt, ...)
 	if (pcs_log_level > LOG_WARN)
 		show_trace();
 
-	pcs_log_terminate();
-
 	/* use same exit code as abort */
 	exit(-134);
 }
 
+static void log_bufqueue_printf(void *arg, const char *fmt, ...)
+{
+	struct bufqueue *bq = arg;
+	va_list va;
+	va_start(va, fmt);
+	bufqueue_vprintf(bq, fmt, va);
+	va_end(va);
+}
+
 __noinline void show_trace(void)
 {
-	/* Trying to flush buffers after some fatal signal, don't mess around.
-	 * This line is mainly necessary because gz_write_buff() calls
-	 * pcs_log() in some conditions. */
-	if (in_fatal_signal_handler)
-		return;
-
-	lock_log();
-	trace_dump(NULL, log_printf);
-	unlock_log();
+	struct bufqueue bq;
+	bufqueue_init(&bq);
+	bq.prealloc_size = 1024;
+	trace_dump(NULL, log_bufqueue_printf, &bq);
+	pcs_log_bufqueue(LOG_ERR | LOG_NOTS, &bq);
+	bufqueue_clear(&bq);
 }
 
 void show_trace_coroutine(struct pcs_ucontext *ctx)
 {
-	lock_log();
-	trace_dump_coroutine(ctx, log_printf);
-	unlock_log();
+	struct bufqueue bq;
+	bufqueue_init(&bq);
+	bq.prealloc_size = 1024;
+	trace_dump_coroutine(ctx, log_bufqueue_printf, &bq);
+	pcs_log_bufqueue(LOG_ERR | LOG_NOTS, &bq);
+	bufqueue_clear(&bq);
 }
 
 void pcs_log_version_register(const char *version)
@@ -1001,7 +1124,22 @@ const char * init_ops(struct log_writer *l, const char *ext) {
 	return ext;
 }
 
-int pcs_set_logfile_ex(const char *prefix, const char *compression, int flags)
+/* Set the number of log buffers to allocate.
+ * Should be called before actual log creation (pcs_set_logfile)
+ * otherwise it wont have any effect.
+ */
+#define MAX_BUFFERS 64
+
+void pcs_log_set_buffer_count(unsigned nbuffers)
+{
+	if (nbuffers < 2)
+		nbuffers = 2;
+	if (nbuffers > MAX_BUFFERS)
+		nbuffers = MAX_BUFFERS;
+	log_nbuffers = nbuffers;
+}
+
+static int init_logging(const char *prefix, const char *compression, int flags)
 {
 	int res = 0;
 	struct log_writer* l;
@@ -1021,6 +1159,8 @@ int pcs_set_logfile_ex(const char *prefix, const char *compression, int flags)
 
 	/* Allocate context */
 	l = pcs_xzmalloc(sizeof(*l));
+	l->nb = log_nbuffers;
+	l->b = pcs_xzmalloc(sizeof(l->b[0]) * l->nb);
 
 	l->lflags = flags;
 
@@ -1056,12 +1196,13 @@ int pcs_set_logfile_ex(const char *prefix, const char *compression, int flags)
 		strncpy(l->rotate.ext, ext, sizeof(l->rotate.ext) - 1);
 		l->rotate.ext[sizeof(l->rotate.ext) - 1] = '\0';
 
-		l->fname = pcs_xasprintf("%s%s%s", prefix, (l->rotate.ext[0] != '\0') ? "." : "", l->rotate.ext);
+		l->fname = pcs_xasprintf("%s%s%s", l->rotate.basename, (l->rotate.ext[0] != '\0') ? "." : "", l->rotate.ext);
 	}
 
 	/* Open log file */
 	if (l->open_log(l)) {
 		LOGGER_ERR("Can't initialize log subsystem.\n");
+		pcs_free(l->b);
 		pcs_free(l);
 		return PCS_ERR_IO;
 	}
@@ -1086,9 +1227,23 @@ int pcs_set_logfile_ex(const char *prefix, const char *compression, int flags)
 	/* Succeeded */
 	logwriter = l;
 	write_log_header(l);
-	atexit(pcs_log_terminate);
+	pcs_atexit(&log_atexit_hook);
 
 	return 0;
+}
+
+int pcs_set_logfile_ex(const char *dir, const char *prefix, const char *compression, int flags) {
+	int rc;
+	char *full_prefix;
+
+	if (flags & PCS_LOG_ROTATE_MULTIPROC) {
+		full_prefix = pcs_xasprintf("%s%c%s", dir, PCS_PATH_SEP, prefix);
+	} else {
+		full_prefix = pcs_xasprintf("%s%c%s.log", dir, PCS_PATH_SEP, prefix);
+	}
+	rc = init_logging(full_prefix, compression, flags);
+	pcs_free(full_prefix);
+	return rc;
 }
 
 int pcs_set_logfile(const char *path)
@@ -1100,7 +1255,8 @@ int pcs_set_logfile(const char *path)
 	basename = get_basename_ext(path, &ext);
 	if (strlen(ext) > 0)
 		ext = ext + 1;
-	rc = pcs_set_logfile_ex(basename, ext, PCS_LOG_ROTATE_ENUM);
+
+	rc = init_logging(basename, ext, PCS_LOG_ROTATE_ENUM);
 	pcs_free(basename);
 
 	return rc;
@@ -1131,7 +1287,7 @@ char* pcs_get_logfile_base_ext(const char** pext)
 	}
 }
 
-void pcs_set_log_handler(void (*handler)(int level, int indent, const char *prefix, const char *fmt, va_list va))
+void pcs_set_log_handler(void (*handler)(int level, const char *buf, unsigned int len))
 {
 	/* Only one of two functions: pcs_set_logfile() or pcs_set_log_handler() must be called. */
 	BUG_ON(logwriter);
@@ -1185,11 +1341,6 @@ static struct log_buff * flush_full_buffers(void)
 	int next_buff;
 	struct log_buff *b;
 
-	if (log_nonl) {
-		log_printf("");
-		log_nonl = 0;
-	}
-
 	if (!logwriter)
 		return NULL;
 
@@ -1206,7 +1357,7 @@ static struct log_buff * flush_full_buffers(void)
 
 	/* flush full buffers first */
 	while (1) {
-		next_buff = LOG_BUFF_NEXT(logwriter->written);
+		next_buff = log_buff_next(logwriter, logwriter->written);
 		b = &logwriter->b[next_buff];
 		if (!b->full)
 			break;
@@ -1274,10 +1425,11 @@ void pcs_log_fatal_sighandler(int sig, siginfo_t *info, void *context)
 	struct log_buff *b = flush_full_buffers();
 
 	describe_signal(sig, info, register_get_pc((ucontext_t*)context));
-	register_dump((ucontext_t*)context, log_printf);
-	trace_dump((ucontext_t*)context, log_printf);
+	register_dump((ucontext_t*)context, __log_printf, NULL);
+	trace_dump((ucontext_t*)context, __log_printf, NULL);
 
 	flush_log_buffer(b);
+	pcs_call_atexit(exit_fatal);
 
 	/* re-raise signal, handler is reset due to SA_RESETHAND and leads to default handler (core) */
 	raise(sig);
@@ -1297,10 +1449,11 @@ LONG __stdcall pcs_log_fatal_sighandler(EXCEPTION_POINTERS *ptrs)
 
 	struct log_buff *b = flush_full_buffers();
 
-	register_dump(ptrs, log_printf);
-	trace_dump(ptrs, log_printf);
+	register_dump(ptrs, __log_printf, NULL);
+	trace_dump(ptrs, __log_printf, NULL);
 
 	flush_log_buffer(b);
+	pcs_call_atexit(exit_fatal);
 
 	if (old_fatal_handler)
 		old_fatal_handler(ptrs);
@@ -1453,13 +1606,13 @@ static void z_close_log(struct log_writer *l)
 			LOGGER_ERR("failed to close compressed log file %s: %d\n", l->fname, res);
 	}
 
-	l->fd = (pcs_fd_t )-1;
+	l->fd = -1;
 	BUG_ON(!z_funcs.file_is_null(l));
 }
 
 static int z_reopen_stream(struct log_writer* l)
 {
-	int fd = log_file_dup((int)l->fd);
+	int fd = log_file_dup(l->fd);
 	if (fd < 0) {
 		LOGGER_ERR("failed to duplicate file descriptor %s\n", strerror(errno));
 		z_close_log(l);
@@ -1467,7 +1620,7 @@ static int z_reopen_stream(struct log_writer* l)
 	}
 
 	z_close_log(l);
-	if (log_file_getsize(fd, (u64*)(&l->log_size)) < 0) {
+	if (log_file_getsize(fd, &l->log_size) < 0) {
 		LOGGER_ERR("failed to get file size %s\n", strerror(errno));
 		goto _err;
 	}
@@ -1481,7 +1634,7 @@ static int z_reopen_stream(struct log_writer* l)
 		goto _err;
 	}
 
-	l->fd = (pcs_fd_t)fd;
+	l->fd = fd;
 	return 0;
 
 _err:
@@ -1492,15 +1645,16 @@ _err:
 static int z_open_log_by_fd(struct log_writer *l, int fd)
 {
 	int err = 0;
-	u64 size = 0;
+	long long size = 0, offs;
 
 	if ((err = log_file_getsize(fd, &size)) < 0) {
 		LOGGER_ERR("failed to get file size - %s\n", strerror(errno));
 		goto _end;
 	}
 
-	if ((err = log_file_lseek(fd, 0, SEEK_END)) < 0) {
+	if ((offs = log_file_lseek(fd, 0, SEEK_END)) < 0) {
 		LOGGER_ERR("failed to seek to the end of file - %s\n", strerror(errno));
+		err = (int)offs;
 		goto _end;
 	}
 
@@ -1510,7 +1664,7 @@ static int z_open_log_by_fd(struct log_writer *l, int fd)
 		goto _end;
 	}
 
-	l->fd = (pcs_fd_t)fd;
+	l->fd = fd;
 	l->log_size = size;
 _end:
 	return err;
@@ -1541,7 +1695,7 @@ static int z_truncate_existing_and_open(struct log_writer *log, int fd, u64 size
 static int z_add_last_record(struct log_writer *log, unsigned char *buf, int buf_len)
 {
 	int err;
-	u64 size = 0;
+	long long size = 0;
 	char str[128];
 
 	if (!buf_len)
@@ -1592,7 +1746,7 @@ done:
 static int z_open_log(struct log_writer *l)
 {
 	int fd = 0;
-	u64 size = 0;
+	long long size = 0;
 
 	BUG_ON(!l->fname);
 	if (log_fname_lock(l) < 0)
@@ -1630,7 +1784,7 @@ static int z_open_log(struct log_writer *l)
 
 static void z_write_buff(struct log_writer* l, struct log_buff* b)
 {
-	int size = b->full;
+	size_t size = b->full;
 	char *ptr = b->buff;
 	BUG_ON(!size);
 	BUG_ON(size > LOG_BUFF_SZ);
@@ -1641,7 +1795,7 @@ static void z_write_buff(struct log_writer* l, struct log_buff* b)
 	}
 
 	while (size > 0) {
-		int rc = z_funcs.write(l, ptr, size);
+		int rc = z_funcs.write(l, ptr, (int)size);
 		if (!rc) {
 			int err;
 			const char *errmsg;
@@ -1665,7 +1819,7 @@ static int z_reopen_log(struct log_writer* l)
 	int fd = 0;
 
 	z_close_log(l);
-	BUG_ON(l->lock_fd == PCS_INVALID_FD);
+	BUG_ON((l->lflags & PCS_LOG_ROTATE_MASK) != PCS_LOG_ROTATE_MULTIPROC && l->lock_fd == PCS_INVALID_FD);
 	fd = log_file_open(l->fname, O_RDWR|O_CREAT, 0666);
 	if (fd < 0) {
 		LOGGER_ERR("Unable open file %s - %s\n", l->fname, strerror(errno));
@@ -1678,14 +1832,14 @@ static int z_reopen_log(struct log_writer* l)
 		return -1;
 	}
 
-	l->fd = (pcs_fd_t)fd;
+	l->fd = fd;
 	l->log_size = 0;
 	return 0;
 }
 #endif /* defined(_ENABLE_GZIP_COMPRESSION) || defined(_ENABLE_ZSTD_COMPRESSION) */
 
 #ifdef _ENABLE_GZIP_COMPRESSION
-static int gz_dopen(struct log_writer *l, pcs_fd_t fd)
+static int gz_dopen(struct log_writer *l, int fd)
 {
 	int gz_fd = log_file_dup(fd);
 	if (gz_fd < 0)
@@ -1742,14 +1896,14 @@ static int gz_flush(struct log_writer *l)
 #else
 #define HDR_OSCODE      3
 #endif
-#define HDR_OSCODE_MASK 0x1f
+#define HDR_OSCODE_MASK 0xe0 /* ~0x1f */
 #define GZ_FOOTER_LEN  8
 
 static const unsigned char gz_hdr_signature[10] =
 	{ 0x1f, 0x8b, Z_DEFLATED, HDR_FLAGS, 0, 0, 0, 0, HDR_XFLAGS, 0 /* OSCODE is masked as variable */};
 
 static const unsigned char gz_hdr_mask[10] =
-	{ 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0xff, ~HDR_OSCODE_MASK };
+	{ 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0xff, HDR_OSCODE_MASK };
 
 struct gz_footer {
 	u32 crc32;
@@ -1942,7 +2096,7 @@ rotate:
 
 static void init_ops_gzip(struct log_writer* l)
 {
-	l->fd = (pcs_fd_t)-1;
+	l->fd = -1;
 	l->gz_file = NULL;
 
 	l->open_log = z_open_log;
@@ -1964,16 +2118,16 @@ static void init_ops_gzip(struct log_writer* l)
 #endif /* _ENABLE_GZIP_COMPRESSION */
 
 #ifdef _ENABLE_ZSTD_COMPRESSION
-static s32 file_write(int fd, const void* buff, u32 count)
+static int file_write(int fd, const void* buff, size_t count)
 {
 #ifdef __WINDOWS__
-	return (s32)_write(fd, buff, count);
+	return _write(fd, buff, (int)count);
 #else /* __WINDOWS__ */
-	return (s32)write(fd, buff, count);
+	return write(fd, buff, (int)count);
 #endif /* __WINDOWS__ */
 }
 
-static int write_data(pcs_fd_t fd, const char *buff, int sz)
+static int write_data(int fd, const char *buff, size_t sz)
 {
 	while (sz) {
 		int n = file_write(fd, buff, sz);
@@ -1998,7 +2152,7 @@ static int zst_flush(struct log_writer *l)
 	return 0; /* everything already flushed */
 }
 
-static int zst_dopen(struct log_writer *l, pcs_fd_t fd)
+static int zst_dopen(struct log_writer *l, int fd)
 {
 	zst_clearerr(l);
 	return 0;
@@ -2012,13 +2166,13 @@ static int zst_close(struct log_writer *l)
 
 static int zst_file_is_null(struct log_writer* l)
 {
-	return (l->fd == (pcs_fd_t )-1);
+	return (l->fd == -1);
 }
 
 static int zst_write(struct log_writer *l, const void *buff, int len)
 {
 	void *compress_buff = l->zst.compress_buff;
-	int compress_buff_size = l->zst.compress_buff_size;
+	size_t compress_buff_size = l->zst.compress_buff_size;
 
 	size_t const compressed_size = ZSTD_compress(compress_buff, compress_buff_size,
 		buff, len, ZSTD_COMPRESSION_LEVEL);
@@ -2047,7 +2201,7 @@ static const char *zst_error(struct log_writer *l, int *errnum)
 
 static int zst_puts(struct log_writer *l, char *str)
 {
-	return zst_write(l, str, strlen(str));
+	return zst_write(l, str, (int)strlen(str));
 }
 
 /*
@@ -2110,7 +2264,7 @@ static int zst_last_frame(int fd, u64 size, unsigned char **pbuf, int *pframe_le
 
 	*pbuf = buf_;
 	*pframe_offset = header - buf_;
-	*pframe_len = buf_len - *pframe_offset;
+	*pframe_len = (int)(buf_len - *pframe_offset);
 	*poffs = offs;
 	return 0;
 
@@ -2123,7 +2277,7 @@ err:
 	return -1;
 }
 
-static int zst_decode_last_record(const unsigned char *frame, int frame_len, unsigned char **data, int *data_size)
+static int zst_decode_last_record(const unsigned char *frame, size_t frame_len, unsigned char **data, size_t *data_size)
 {
 	/* should use streaming api as we don't know real data size if they are corrupted */
 	void* data_ = NULL;
@@ -2144,7 +2298,7 @@ static int zst_decode_last_record(const unsigned char *frame, int frame_len, uns
 	if (ZSTD_isError(res))
 		goto err;
 
-	unsigned decompressed_size = 0;
+	size_t decompressed_size = 0;
 	ZSTD_inBuffer input = {.src = frame, .size = frame_len, .pos = 0};
 	while (input.pos < input.size) {
 		ZSTD_outBuffer output = {.dst = data_, .size = data_size_, .pos = 0};
@@ -2165,7 +2319,7 @@ static int zst_decode_last_record(const unsigned char *frame, int frame_len, uns
 	LOGGER_ERR("REC len %d/%d\n", (unsigned)decompressed_size, (unsigned)data_size_);
 
 	*data = (unsigned char *)data_;
-	*data_size = (unsigned)decompressed_size;
+	*data_size = decompressed_size;
 	return 0;
 
 err:
@@ -2175,10 +2329,11 @@ err:
 
 static int zst_open_existing(int fd, u64 size, struct log_writer *log)
 {
-	int frame_len, data_size, err;
+	int frame_len;
+	size_t data_size;
 	unsigned char *buf = NULL, *data = NULL;
 	u64 frame_offset, offset;
-	int reason;
+	int reason, err;
 
 	if (size <= (sizeof(zst_hdr_signature) + zst_hdr_frame_header_min_size)) {
 		err = z_truncate_existing_and_open(log, fd, 0);
@@ -2210,7 +2365,7 @@ static int zst_open_existing(int fd, u64 size, struct log_writer *log)
 		goto rotate;
 
 	reason = 5;
-	err = z_add_last_record(log, data, data_size);
+	err = z_add_last_record(log, data, (int)data_size);
 	if (err)
 		goto err_last_record;
 
@@ -2264,7 +2419,7 @@ static void init_ops_zstd(struct log_writer* l)
 {
 	BUG_ON(zst_magic_test() != 0);
 
-	l->fd = (pcs_fd_t)-1;
+	l->fd = -1;
 
 	l->zst.msg[0] = '\0';
 	l->zst.compress_buff_size = ZSTD_compressBound(LOG_BUFF_SZ);
@@ -2289,9 +2444,6 @@ static void init_ops_zstd(struct log_writer* l)
 
 #endif /* PCS_LOG_ENABLED */
 
-void pcs_err(const char *msg, const char *file, int line, const char *func)
-{
-	pcs_log(LOG_ERR | LOG_NOIND, "%s at %s:%d/%s()", msg, file, line, func);
 #ifdef DEBUG
 #define VER_DEBUG " (Debug)"
 #else
@@ -2303,10 +2455,16 @@ void pcs_err(const char *msg, const char *file, int line, const char *func)
 #define VER_BUILD " build version: N/A"
 #endif
 
-	pcs_log(LOG_ERR | LOG_NOIND, VER_BUILD VER_DEBUG);
+static const char pcs_version_info[] = VER_BUILD VER_DEBUG;
+
+void pcs_err(const char *msg, const char *file, int line, const char *func)
+{
+	pcs_log(LOG_ERR, "%s at %s:%d/%s()", msg, file, line, func);
+
+	pcs_log(LOG_ERR, "%s", pcs_version_info);
 	int i;
 	for (i = 0; i < version_nr; i++)
-		pcs_log(LOG_ERR | LOG_NOIND, " %s", version_list[i]);
+		pcs_log(LOG_ERR, " %s", version_list[i]);
 	show_trace();
 	pcs_abort();
 }
@@ -2340,11 +2498,35 @@ static void write_log_header(struct log_writer *l) {
 	snprintf(tz, sizeof(tz), "%+03d%02d", (int)h, (int)m);
 #endif
 
-	b->used = snprintf(b->buff, LOG_BUFF_SZ, "# Log session started. TZ=%s. Version=%s\n", tz, VER_BUILD VER_DEBUG);
+	b->used = snprintf(b->buff, LOG_BUFF_SZ, "# Log session started. TZ=%s. Version=%s\n", tz, pcs_version_info);
 	b->full = b->used;
 
 	pthread_mutex_lock(&flushlock);
 	l->write_buff(l, b);
 	pthread_mutex_unlock(&flushlock);
 	pcs_free(b);
+}
+
+void pcs_log_bufqueue(int level, struct bufqueue *bq)
+{
+	if ((level & LOG_LEVEL_MASK) > pcs_log_level)
+		return;
+
+	/* Trying to flush buffers after some fatal signal, don't mess around.
+	 * This line is mainly necessary because gz_write_buff() calls
+	 * pcs_log() in some conditions. */
+	if (in_fatal_signal_handler)
+		return;
+
+	u32 len = bufqueue_get_size(bq);
+	char *buf;
+	if (bufqueue_peek(bq, (void **)&buf) == len) {
+		log_print_buf(level, buf, len);
+		return;
+	}
+
+	buf = pcs_xmalloc(len);
+	len = bufqueue_get_copy(bq, buf, len);
+	log_print_buf(level, buf, len);
+	pcs_free(buf);
 }

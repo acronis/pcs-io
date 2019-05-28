@@ -8,7 +8,9 @@
 #include "pcs_coroutine.h"
 #include "std_list.h"
 
+#ifndef PCS_CO_LOCK_TIMEOUT
 #define PCS_CO_LOCK_TIMEOUT	60000
+#endif
 
 /* ----------------------------------- Waitqueue API ---------------------------------- */
 

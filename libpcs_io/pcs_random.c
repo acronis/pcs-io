@@ -9,55 +9,10 @@
 
 #ifndef __WINDOWS__
 #include <unistd.h>
-#include <string.h>
 #else
 #define SystemFunction036 NTAPI SystemFunction036
 #include <NTSecAPI.h>
 #undef SystemFunction036
-#endif
-
-/* We cannot use plain libc random number generator in libpcs_client, we are not allowed to spoil
- * seed probably used by another components.
- */
-
-#ifdef __linux__
-
-unsigned int pcs_random(struct pcs_rng * rdat)
-{
-	int32_t res;
-
-	if (random_r(&rdat->data, &res))
-		BUG();
-
-	return res;
-}
-
-void pcs_srandom(struct pcs_rng * rdat, unsigned int seed)
-{
-	memset(&rdat->data, 0, sizeof(rdat->data));
-
-	if (initstate_r(seed, (char *)rdat->s, sizeof(rdat->s), &rdat->data))
-		BUG();
-}
-
-#else
-
-unsigned int pcs_random(struct pcs_rng * rdat)
-{
-	unsigned int res = rdat->data;
-
-	/* PCS_RAND_MAX is expected to be 2^31 - 1 */
-	res = (1103515245U * res + 12345) & PCS_RAND_MAX;
-
-	rdat->data = res;
-	return res;
-}
-
-void pcs_srandom(struct pcs_rng *rdat, unsigned int seed)
-{
-	rdat->data = seed;
-}
-
 #endif
 
 /* Fill buffer with pseudo random content. Returns 0 on success and -1 otherwise */
@@ -67,13 +22,13 @@ int pcs_get_urandom(void *buf, int sz)
 	pcs_fd_t fd;
 	int ret = pcs_sync_open("/dev/urandom", O_RDONLY, 0, &fd);
 	if (ret) {
-		pcs_log(LOG_ERR, "Unable open /dev/urandom - %s", strerror(-ret));
+		pcs_log_syserror(LOG_ERR, ret, "Unable open /dev/urandom");
 		return -1;
 	}
 	ret = pcs_sync_sread(fd, buf, sz);
 	pcs_sync_close(fd);
 	if (ret < 0) {
-		pcs_log(LOG_ERR, "Can't read from /dev/urandom - %s", strerror(-ret));
+		pcs_log_syserror(LOG_ERR, ret, "Can't read from /dev/urandom");
 		return -1;
 	}
 	if (ret != sz) {
@@ -89,38 +44,110 @@ int pcs_get_urandom(void *buf, int sz)
 	return 0;
 }
 
-static unsigned int getseed(void)
+void pcs_srandomdev(struct pcs_rng *rng)
 {
-	unsigned int seed;
-	if (pcs_get_urandom(&seed, sizeof(seed))) {
-		seed = (unsigned int)get_real_time_us();
-#ifndef __WINDOWS__
-		seed += getpid() + getppid();
-#else
-		seed += GetCurrentProcessId();
-#endif
+	if (!pcs_get_urandom(rng->data, sizeof(rng->data))) {
+		rng->pos = ~0U;
+		return;
 	}
-	return seed;
+
+	u64 seed = get_real_time_us();
+#ifndef __WINDOWS__
+	seed += getpid() + getppid();
+#else
+	seed += GetCurrentProcessId();
+#endif
+	pcs_srandom(rng, seed);
 }
 
-unsigned int pcs_srandomdev(struct pcs_rng *rdat)
-{
-	unsigned int seed = getseed();
-	pcs_srandom(rdat, seed);
-	return seed;
-}
-
-unsigned long long pcs_rand_range(struct pcs_rng * rdat, unsigned long long min, unsigned long long max)
+u64 pcs_rand_range(struct pcs_rng *rng, u64 min, u64 max)
 {
 	BUG_ON(max < min);
 
-	const unsigned long long U64_MAX = ~0ull;
-	const unsigned hi = pcs_random(rdat);
-	const unsigned lo = pcs_random(rdat);
-	const unsigned mid = pcs_random(rdat);
+	u64 rnd = pcs_random(rng);
+	u64 range = max - min;
+	if ((range & (range + 1)) == 0)
+		rnd &= range;
+	else
+		rnd %= range + 1;
+	return min + rnd;
+}
 
-	/* take hi bits [30:10], mid bits [30:10] and lo bits [30:9] */
-	const unsigned long long rnd_u64 = ((hi & ~0x3ffull) << 33) | ((mid & ~0x3ffull) << 12) | ((lo & ~0x1fful) >> 9);
+/*
+	This is a 64-bit version of Mersenne Twister pseudorandom number
+	generator.
 
-	return min + (unsigned long long)((rnd_u64 / (U64_MAX + 1.0)) * (max - min + 1));
+	Copyright (C) 2004, Makoto Matsumoto and Takuji Nishimura,
+	All rights reserved.
+
+	Redistribution and use in source and binary forms, with or without
+	modification, are permitted provided that the following conditions
+	are met:
+
+	  1. Redistributions of source code must retain the above copyright
+	     notice, this list of conditions and the following disclaimer.
+
+	  2. Redistributions in binary form must reproduce the above copyright
+	     notice, this list of conditions and the following disclaimer in the
+	     documentation and/or other materials provided with the distribution.
+
+	  3. The names of its contributors may not be used to endorse or promote
+	     products derived from this software without specific prior written
+	     permission.
+
+	THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+	"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+	LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+	A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+	CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+	EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+	PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+	PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+	LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+	NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+	SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+
+#define NN		312
+#define MM		156
+#define MATRIX_A	0xB5026F5AA96619E9ULL
+#define UM		0xFFFFFFFF80000000ULL	/* Most significant 33 bits */
+#define LM		0x7FFFFFFFULL		/* Least significant 31 bits */
+
+u64 pcs_random(struct pcs_rng *rng)
+{
+	unsigned i;
+	u64 x;
+
+	if (unlikely(rng->pos >= NN)) {
+		/* generate NN words at one time */
+		for (i = 0; i < NN - MM; i++) {
+			x = (rng->data[i] & UM) | (rng->data[i + 1] & LM);
+			rng->data[i] = rng->data[i + MM] ^ (x >> 1) ^ (x & 1 ? MATRIX_A : 0);
+		}
+		for (i = NN - MM; i < NN - 1; i++) {
+			x = (rng->data[i] & UM) | (rng->data[i + 1] & LM);
+			rng->data[i] = rng->data[i + MM - NN] ^ (x >> 1) ^ (x & 1 ? MATRIX_A : 0);
+		}
+		x = (rng->data[NN - 1] & UM) | (rng->data[0] & LM);
+		rng->data[NN - 1] = rng->data[MM - 1] ^ (x >> 1) ^ (x & 1 ? MATRIX_A : 0);
+		rng->pos = 0;
+	}
+
+	x = rng->data[rng->pos++];
+	x ^= (x >> 29) & 0x5555555555555555ULL;
+	x ^= (x << 17) & 0x71D67FFFEDA60000ULL;
+	x ^= (x << 37) & 0xFFF7EEE000000000ULL;
+	x ^= (x >> 43);
+	return x;
+}
+
+void pcs_srandom(struct pcs_rng *rng, u64 seed)
+{
+	unsigned i;
+
+	rng->data[0] = seed;
+	for (i = 1; i < NN; i++)
+		rng->data[i] = 6364136223846793005ULL * (rng->data[i - 1] ^ (rng->data[i - 1] >> 62)) + i;
+	rng->pos = NN;
 }

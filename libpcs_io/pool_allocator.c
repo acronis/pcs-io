@@ -12,7 +12,11 @@
 #endif
 
 #ifndef PAGE_SIZE
+#ifdef __aarch64__
+#define PAGE_SIZE 0x10000
+#else
 #define PAGE_SIZE 0x1000
+#endif
 #endif
 
 /* The allocator uses memory mapped pages splitting them onto chunks with chunk header

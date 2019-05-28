@@ -1,7 +1,3 @@
-/*
- * Copyright © 2003-2018 Acronis International GmbH.
- */
-
 #ifndef _PCS_JHASH_H_
 #define _PCS_JHASH_H_ 1
 

@@ -48,7 +48,7 @@ static STACK_OF(X509_CRL)* pcs_ssl_socket_lookup_crls(X509_STORE_CTX *ctx, X509_
 	X509 **certs;
 	X509_CRL **crls;
 
-	int r = sock->verify_peer.get_certs(&sock->file, &certs, &crls);
+	int r = sock->verify_peer.get_certs(sock->verify_peer.arg, &certs, &crls);
 	if (r < 0)
 		return NULL;
 
@@ -76,6 +76,49 @@ static int no_crl_check(X509_STORE_CTX *ctx, X509_CRL *crl)
 {
 	return 1;
 }
+
+static void pcs_ssl_socket_update_ctx(struct pcs_ssl_socket *sock)
+{
+#if OPENSSL_VERSION_NUMBER >= 0x10100000
+	SSL_CTX *ctx = SSL_CTX_new(TLS_method());
+#else
+	SSL_CTX *ctx = SSL_CTX_new(SSLv23_method());
+#endif
+	CHECK_ALLOC(ctx);
+
+	/* We need to set the context to the temporary, and then switch back, to fetch
+	   all changes made to SSL_CTX object into SSL object, because calling
+	   SSL_set_SSL_CTX() with the same context is no-op. SSL_set_SSL_CTX() is
+	   undocumented, but used in openssl s_server to switch context in SNI
+	   callback. */
+	SSL_set_SSL_CTX(sock->ssl, ctx);
+	SSL_set_SSL_CTX(sock->ssl, sock->ctx);
+	SSL_CTX_free(ctx);
+}
+
+#if OPENSSL_VERSION_NUMBER >= 0x10101000
+static int pcs_ssl_socket_client_hello_cb(SSL *ssl, int *alert, void *arg)
+{
+	struct pcs_ssl_socket *sock = arg;
+	int r = sock->client_hello.cb(sock->client_hello.arg, ssl, alert);
+	if (r == SSL_CLIENT_HELLO_SUCCESS)
+		pcs_ssl_socket_update_ctx(sock);
+	return r;
+}
+#else
+static int pcs_ssl_socket_servername_cb(SSL *ssl, int *ad, void *arg)
+/* @ad parameter is undocumented and also not used in openssl s_server */
+{
+	struct pcs_ssl_socket *sock = arg;
+	int alert;
+	int r = sock->client_hello.cb(sock->client_hello.arg, ssl, &alert);
+	if (r == SSL_CLIENT_HELLO_SUCCESS) {
+		pcs_ssl_socket_update_ctx(sock);
+		return SSL_TLSEXT_ERR_OK;
+	}
+	return SSL_TLSEXT_ERR_ALERT_FATAL;
+}
+#endif
 
 int pcs_ssl_socket_verify_peer_cert_cb(X509_STORE_CTX *ctx, void *arg)
 {
@@ -230,6 +273,14 @@ void pcs_ssl_socket_init(struct pcs_ssl_socket *sock)
 
 	//SSL_set_cipher_list(sock->ssl, "DHE-RSA-AES128-SHA:DHE-RSA-AES256-SHA:ALL");
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000
+/* OpenSSL 1.0.1e does not have SSL_CTX_set_ecdh_auto(). RHEL 7.x has OpenSSL 1.0.2, and I don't
+   care about builds on older systems. Let them just use whatever key exchange algorithms they have. */
+#if OPENSSL_VERSION_NUMBER >= 0x10002000
+	SSL_CTX_set_ecdh_auto(sock->ctx, 1);
+#endif
+#endif
+
 	sock->verify_peer.depth = 0;
 	SSL_CTX_set_verify(sock->ctx, SSL_VERIFY_NONE, 0);
 
@@ -299,13 +350,78 @@ int pcs_ssl_socket_set_server_name_indication(struct pcs_co_file *file, const ch
 	return 0;
 }
 
+#if OPENSSL_VERSION_NUMBER >= 0x10101000
+int pcs_ssl_socket_get_server_name_indication(struct pcs_co_file *file, char **value)
+{
+	struct pcs_ssl_socket *sock = file2sock(file);
+
+	/* Code is taken from here (modified):
+	   https://github.com/openssl/openssl/blob/master/test/handshake_helper.c */
+
+	const unsigned char *p;
+	size_t len, remaining;
+
+	if (!SSL_client_hello_get0_ext(sock->ssl, TLSEXT_TYPE_server_name, &p, &remaining)) {
+		(*value) = NULL;
+		return 0;
+	}
+	if (remaining <= 2)
+		return -PCS_ERR_INVALID;
+	/* Extract the length of the supplied list of names. */
+	len = *(p++) << 8;
+	len += *(p++);
+	if (len + 2 != remaining)
+		return -PCS_ERR_INVALID;
+	remaining = len;
+	/* The list in practice only has a single element, so we only consider the
+	   first one. */
+	if (remaining == 0 || *p++ != TLSEXT_NAMETYPE_host_name)
+		return -PCS_ERR_INVALID;
+	--remaining;
+	/* Now we can finally pull out the byte array with the actual hostname. */
+	if (remaining <= 2)
+		return -PCS_ERR_INVALID;
+	len = *(p++) << 8;
+	len += *(p++);
+	if (len + 2 > remaining)
+		return -PCS_ERR_INVALID;
+	(*value) = pcs_xstrndup((const char *)p, len);
+	return 0;
+}
+#else
+int pcs_ssl_socket_get_server_name_indication(struct pcs_co_file *file, char **value)
+{
+	struct pcs_ssl_socket *sock = file2sock(file);
+	const char *servername = SSL_get_servername(sock->ssl, TLSEXT_NAMETYPE_host_name);
+	(*value) = (servername == NULL)
+		? NULL
+		: pcs_xstrdup(servername);
+	return 0;
+}
+#endif
+
+void pcs_ssl_socket_set_client_hello_cb(struct pcs_co_file *file, int (*cb)(void *arg, SSL *ssl, int *alert), void *arg)
+{
+	struct pcs_ssl_socket *sock = file2sock(file);
+	sock->client_hello.cb = cb;
+	sock->client_hello.arg = arg;
+
+#if OPENSSL_VERSION_NUMBER >= 0x10101000
+	SSL_CTX_set_client_hello_cb(sock->ctx, &pcs_ssl_socket_client_hello_cb, sock);
+#else
+	SSL_CTX_set_tlsext_servername_callback(sock->ctx, &pcs_ssl_socket_servername_cb);
+	SSL_CTX_set_tlsext_servername_arg(sock->ctx, sock);
+#endif
+}
+
 int pcs_ssl_socket_set_verify_peer(struct pcs_co_file *file, unsigned int depth,
-		int (*get_certs)(struct pcs_co_file *file, X509 ***certs, X509_CRL ***crls), u8 require_peer_cert)
+		int (*get_certs)(void *arg, X509 ***certs, X509_CRL ***crls), void *arg, u8 require_peer_cert)
 {
 	struct pcs_ssl_socket *sock = file2sock(file);
 
 	sock->verify_peer.depth = depth;
 	sock->verify_peer.get_certs = get_certs;
+	sock->verify_peer.arg = arg;
 
 	int verify_flags = SSL_VERIFY_PEER;
 	if (require_peer_cert)
@@ -313,6 +429,14 @@ int pcs_ssl_socket_set_verify_peer(struct pcs_co_file *file, unsigned int depth,
 
 	SSL_CTX_set_verify(sock->ctx, verify_flags, 0);
 	SSL_CTX_set_verify_depth(sock->ctx, depth);
+	if (sock->ssl != NULL) {
+		/* At the point of ClientHello callback, sock->ssl is already created
+		   from sock->ctx, so we must update its verification
+		   settings. pcs_ssl_socket_update_ctx() has no effect on these
+		   settings, SSL_set_verify*() functions exist for that purpose. */
+		SSL_set_verify(sock->ssl, verify_flags, 0);
+		SSL_set_verify_depth(sock->ssl, depth);
+	}
 	SSL_CTX_set_cert_verify_callback(sock->ctx, &pcs_ssl_socket_verify_peer_cert_cb, sock);
 
 	X509_STORE *cert_store = SSL_CTX_get_cert_store(sock->ctx);
@@ -320,7 +444,7 @@ int pcs_ssl_socket_set_verify_peer(struct pcs_co_file *file, unsigned int depth,
 
 	X509 **certs;
 	X509_CRL **crls;
-	int r = get_certs(&sock->file, &certs, &crls);
+	int r = get_certs(arg, &certs, &crls);
 	if (r < 0) {
 		snprintf(sock->err_msg, sizeof(sock->err_msg), "failed to set the chain of trust: get_certs() failed with error %i (%s)", r, pcs_strerror(r));
 		return r;

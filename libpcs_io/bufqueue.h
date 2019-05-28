@@ -5,6 +5,7 @@
 #pragma once
 
 #include "pcs_types.h"
+#include "pcs_config.h"
 #include "std_list.h"
 
 #include <stdarg.h>
@@ -111,12 +112,27 @@ PCS_API void bufqueue_splice_tail(struct bufqueue *src, struct bufqueue *dst);
 #define bufqueue_move(dst, src, size)	TRACE_ALLOC(__bufqueue_move, 1, dst, src, size)
 
 /* Get the length of @bq in bytes. */
-PCS_API u32 bufqueue_get_size(const struct bufqueue *bq);
+static inline u32 bufqueue_get_size(const struct bufqueue *bq)
+{
+	return bq->total_size;
+}
+
 /* Check whether @bq is empty. */
-PCS_API int bufqueue_empty(const struct bufqueue *bq);
-PCS_API int bufqueue_empty_unsafe(const struct bufqueue *bq);
+static inline int bufqueue_empty(const struct bufqueue *bq)
+{
+	return bq->total_size == 0;
+}
+
+static inline int bufqueue_empty_unsafe(const struct bufqueue *bq) __no_sanitize_thread
+{
+	return bq->total_size == 0;
+}
+
 /* Check whether the current size of @bq is above the soft size limit. */
-PCS_API int bufqueue_no_space(const struct bufqueue *bq);
+static inline int bufqueue_no_space(const struct bufqueue *bq)
+{
+	return bq->total_size >= bq->size_limit;
+}
 
 /**
    Retrieve @size bytes from the head of the queue @bq, and copy them into the buffer @data.
@@ -194,6 +210,31 @@ PCS_API u32 bufqueue_peek_at(const struct bufqueue *bq, u32 offset, void **data,
    \returns the length of the maximal contiguous block starting at the current position of @bq.
  */
 PCS_API u32 bufqueue_peek_next(const struct bufqueue *bq, void **data, struct bufqueue_iter *iter);
+
+/**
+   Retrieve the pointers to @iovcnt maximal contiguous block starting at @offset,
+   and the size of them. The call leaves the current position of @bq unchanged.
+
+   \param @bq the buffer queue
+   \param @offset the starting offset of a range
+   \param @iov iovec to fill with pointers to buffers of @bq
+   \param @iovcnt the length of @iov
+   \param @iter (optional, output) iterator for use by bufqueue_peek_next_iov()
+   \returns the number of entries filled in @iov.
+ */
+PCS_API int bufqueue_peek_at_iov(const struct bufqueue *bq, u32 offset, struct iovec *iov, int iovcnt, struct bufqueue_iter *iter);
+
+/**
+   Retrieve the pointers to next @iovcnt contiguous blocks, and the size of them.
+   Theh call leaves the current position of @bq unchanged.
+
+   \param @bq the buffer queue
+   \param @iov iovec to fill with pointers to buffers of @bq
+   \param @iovcnt the length of @iov
+   \param @iter iterator, its value is updated by the call
+   \returns the number of entries filled in @iov.
+ */
+PCS_API int bufqueue_peek_next_iov(const struct bufqueue *bq, struct iovec *iov, int iovcnt, struct bufqueue_iter *iter);
 
 /**
    Retrieve @size bytes starting at @offset, and copy them to a buffer @data. If @bq

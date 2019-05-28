@@ -77,6 +77,7 @@ PCS_API int pcs_netaddr2sockaddr(PCS_NET_ADDR_T const* addr, struct sockaddr **_
 PCS_API int pcs_netaddr2afamily(PCS_NET_ADDR_T const* addr);
 PCS_API int pcs_sockaddr2netaddr(PCS_NET_ADDR_T *addr, struct sockaddr *sa);
 PCS_API int pcs_format_netaddr(char * str, int len, PCS_NET_ADDR_T const* addr);
+PCS_API int pcs_format_netaddr_port(char * str, int len, unsigned *port, PCS_NET_ADDR_T const* addr);
 PCS_API int pcs_netaddr_cmp(PCS_NET_ADDR_T const* addr1, PCS_NET_ADDR_T const* addr2);
 PCS_API int pcs_netaddr_cmp_ignore_port(PCS_NET_ADDR_T const* addr1, PCS_NET_ADDR_T const* addr2);
 PCS_API int pcs_netaddr2hostname(PCS_NET_ADDR_T *addr, char *buf, int size);

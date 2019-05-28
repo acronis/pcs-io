@@ -33,7 +33,29 @@
 static const struct pcs_co_file_ops pcs_co_file_ops;
 static const struct pcs_co_file_ops pcs_co_sock_ops;
 static const struct pcs_co_file_ops pcs_co_file_with_preadv_ops;
+static const struct pcs_co_file_ops pcs_co_dummy_ops;
 static struct pcs_co_file *pcs_co_file_alloc(pcs_fd_t fd, const struct pcs_co_file_ops *ops);
+static struct pcs_co_file *pcs_co_file_alloc_dummy(pcs_fd_t fd);
+
+/* -------------------------------------------------------------------------------------------------- */
+
+static pcs_sock_t pcs_new_socket(int family, int type)
+{
+#ifdef SOCK_CLOEXEC
+	return socket(family, type | SOCK_CLOEXEC, 0);
+#elif defined(__WINDOWS__) || defined(__MAC__)
+	/* On Mac we use POSIX_SPAWN_CLOEXEC_DEFAULT and do not care about CLOEXEC state */
+	return socket(family, type, 0);
+#else
+	struct pcs_co_rwlock *lock = pcs_current_proc->exec_lock;
+	pcs_co_read_lock(lock);
+	pcs_sock_t fd = socket(family, type, 0);
+	if (fd >= 0)
+		fcntl(fd, F_SETFD, FD_CLOEXEC);
+	pcs_co_read_unlock(lock);
+	return fd;
+#endif
+}
 
 /* -------------------------------------------------------------------------------------------------- */
 
@@ -43,18 +65,71 @@ int pcs_co_file_pipe(struct pcs_co_file ** in_file, struct pcs_co_file ** out_fi
 {
 	int pfd[2];
 
+#ifdef HAVE_PIPE2
+	if (pipe2(pfd, O_CLOEXEC))
+		return -errno;
+#elif defined(__MAC__)
+	/* On Mac we use POSIX_SPAWN_CLOEXEC_DEFAULT and do not care about CLOEXEC state */
 	if (pipe(pfd))
 		return -errno;
+#else
+	struct pcs_co_rwlock *lock = pcs_current_proc->exec_lock;
+	pcs_co_read_lock(lock);
+	if (pipe(pfd)) {
+		int rc = -errno;
+		pcs_co_read_unlock(lock);
+		return rc;
+	}
+	fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
+	fcntl(pfd[1], F_SETFD, FD_CLOEXEC);
+	pcs_co_read_unlock(lock);
+#endif
 
 	*in_file = pcs_co_file_alloc_socket(pfd[0]);
 	*out_file = pcs_co_file_alloc_socket(pfd[1]);
+	return 0;
+}
 
+int pcs_co_file_pipe_ex(struct pcs_co_file ** in_file, struct pcs_co_file ** out_file, int pipe_for_exec)
+{
+	int pfd[2];
+
+#ifdef HAVE_PIPE2
+	if (pipe2(pfd, O_CLOEXEC))
+		return -errno;
+#elif defined(__MAC__)
+	/* On Mac we use POSIX_SPAWN_CLOEXEC_DEFAULT and do not care about CLOEXEC state */
+	if (pipe(pfd))
+		return -errno;
+#else
+	BUG_ON(!pcs_co_is_write_locked(pcs_current_proc->exec_lock));
+
+	if (pipe(pfd))
+		return -errno;
+
+	fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
+	fcntl(pfd[1], F_SETFD, FD_CLOEXEC);
+#endif
+
+	*in_file = (pipe_for_exec == PCS_CO_IN_PIPE_FOR_EXEC) ? pcs_co_file_alloc_dummy(pfd[0]) : pcs_co_file_alloc_socket(pfd[0]);
+	*out_file = (pipe_for_exec == PCS_CO_OUT_PIPE_FOR_EXEC) ? pcs_co_file_alloc_dummy(pfd[1]) : pcs_co_file_alloc_socket(pfd[1]);
+	return 0;
+}
+
+int pcs_co_open_dev_null(int flags, struct pcs_co_file ** file)
+{
+	int fd, rc;
+
+	if ((rc = pcs_sync_open("/dev/null", flags, 0, &fd)))
+		return rc;
+
+	*file = pcs_co_file_alloc_dummy(fd);
 	return 0;
 }
 
 /* -------------------------------------------------------------------------------------------------- */
 
-#ifdef __LINUX__
+#if defined(__LINUX__)
 
 #if !__GLIBC_PREREQ(2, 10)
 
@@ -175,7 +250,75 @@ static int pcs_co_sync_writev(struct pcs_co_file *file, int iovcnt, struct iovec
 	return pcs_co_filejob(pcs_current_proc->co_io, _co_file_job_writev, &req);
 }
 
-#else /* __LINUX__ */
+#elif defined(__MAC__)
+
+struct _co_iov_req_rw
+{
+	struct pcs_co_file *file;
+	u64 offset;
+
+	int iovcnt;
+	const struct iovec *iov;
+};
+
+static int _co_file_job_writev(void *arg)
+{
+	struct _co_iov_req_rw *req = (struct _co_iov_req_rw *)arg;
+	struct pcs_co_file *file = req->file;
+	int fd = pcs_co_file_fd(file);
+	const struct iovec *iov = req->iov;
+	int iovcnt = req->iovcnt;
+	u64 offset = req->offset;
+	int result = 0;
+	int rc, i, size;
+
+	if (file->wr_offs != offset && (rc = pcs_sync_lseek(fd, offset, SEEK_SET, &file->wr_offs)))
+		return rc;
+
+	while (iovcnt > IOV_MAX) {
+		for (size = 0, i = 0; i < IOV_MAX; i++)
+			size += iov[i].iov_len;
+
+		rc = writev(fd, iov, IOV_MAX);
+		if (rc != size)
+			goto done;
+
+		result += rc;
+		iov += IOV_MAX;
+		iovcnt -= IOV_MAX;
+		file->wr_offs += rc;
+	}
+
+	rc = writev(fd, iov, iovcnt);
+
+done:
+	if (rc < 0)
+		return -errno;
+
+	file->wr_offs += rc;
+	return result + rc;
+}
+
+static int pcs_co_sync_writev(struct pcs_co_file *file, int iovcnt, struct iovec *iov, u64 offset, u32 flags)
+{
+	struct _co_iov_req_rw req = {
+		.file = file,
+		.iovcnt = iovcnt,
+		.iov = iov,
+		.offset = offset,
+	};
+	pcs_co_mutex_lock(&file->wr_mutex);
+	int rc = pcs_co_filejob(pcs_current_proc->co_io, _co_file_job_writev, &req);
+	pcs_co_mutex_unlock(&file->wr_mutex);
+	return rc;
+}
+
+static int pcs_preadv_supported(int flag)
+{
+	return 1;
+}
+
+#else /* !__LINUX__ && !__MAC__ */
 
 static int pcs_preadv_supported(int flag)
 {
@@ -459,7 +602,7 @@ static int pcs_co_connect_sa(struct sockaddr * sa, unsigned int sa_len, struct p
 {
 	int fd, err;
 
-	while ((fd = socket(sa->sa_family, SOCK_STREAM, 0)) < 0) {
+	while ((fd = pcs_new_socket(sa->sa_family, SOCK_STREAM)) < 0) {
 		err = errno;
 		if (pcs_fd_gc_on_error(pcs_current_proc, err, 1) <= 0)
 			return -err;
@@ -513,7 +656,18 @@ static int pcs_co_accept_sa(struct pcs_co_file * listen, struct sockaddr * sa, u
 		if ((err = pcs_cancelable_prepare_wait(&listen->reader, pcs_current_co->ctx)))
 			return err;
 
+#ifdef HAVE_ACCEPT4
+		fd = accept4(pcs_co_file_sock(listen), sa, sa_len, SOCK_CLOEXEC);
+#elif defined(__MAC__)
 		fd = accept(pcs_co_file_sock(listen), sa, sa_len);
+#else
+		struct pcs_co_rwlock *lock = pcs_current_proc->exec_lock;
+		pcs_co_read_lock(lock);
+		fd = accept(pcs_co_file_sock(listen), sa, sa_len);
+		if (fd >= 0)
+			fcntl(fd, F_SETFD, FD_CLOEXEC);
+		pcs_co_read_unlock(lock);
+#endif
 		if (fd >= 0)
 			break;
 
@@ -567,6 +721,46 @@ static int pcs_co_sync_read(struct pcs_co_file *file, void * buf, int size, u64 
 	return pcs_co_filejob(pcs_current_proc->co_io, _co_sync_io_read, &req);
 }
 
+#ifdef __MAC__
+struct _co_io_req_wr
+{
+	struct pcs_co_file *file;
+	void *buf;
+	int size;
+	u64 offset;
+};
+
+static int _co_sync_io_write(void *arg)
+{
+	struct _co_io_req_wr *req = arg;
+	struct pcs_co_file *file = req->file;
+	u64 offset = req->offset;
+	int fd = pcs_co_file_fd(file);
+	int rc;
+
+	if (file->wr_offs != offset && (rc = pcs_sync_lseek(fd, offset, SEEK_SET, &file->wr_offs)))
+		return rc;
+	if ((rc = pcs_sync_swrite(fd, req->buf, req->size)))
+		return rc;
+
+	file->wr_offs += req->size;
+	return 0;
+}
+
+static int pcs_co_sync_write(struct pcs_co_file *file, const void *buf, int size, u64 offset, u32 flags)
+{
+	struct _co_io_req_wr req = {
+		.file = file,
+		.buf = (void *)buf,
+		.size = size,
+		.offset = offset,
+	};
+	pcs_co_mutex_lock(&file->wr_mutex);
+	int rc = pcs_co_filejob(pcs_current_proc->co_io, _co_sync_io_write, &req);
+	pcs_co_mutex_unlock(&file->wr_mutex);
+	return rc;
+}
+#else /* !__MAC__ */
 static int _co_sync_io_write(void * arg)
 {
 	struct _co_io_req_rw * req = arg;
@@ -583,6 +777,7 @@ static int pcs_co_sync_write(struct pcs_co_file *file, const void * buf, int siz
 	};
 	return pcs_co_filejob(pcs_current_proc->co_io, _co_sync_io_write, &req);
 }
+#endif /* !__MAC__ */
 
 /* -------------------------------------------------------------------------------------------------- */
 
@@ -590,6 +785,13 @@ static int pcs_co_sync_close(struct pcs_co_file *file)
 {
 	/* close() can block on NFS or vstorage... */
 	int rc = pcs_co_file_close_fd(pcs_co_file_fd(file));
+	pcs_free(file);
+	return rc;
+}
+
+static int pcs_dummy_close(struct pcs_co_file *file)
+{
+	int rc = pcs_sync_close(pcs_co_file_fd(file));
 	pcs_free(file);
 	return rc;
 }
@@ -704,6 +906,11 @@ static void disable_notifications(struct pcs_co_file *file, u8 skip_sync_notify)
 
 int pcs_co_file_pipe(struct pcs_co_file ** in_file, struct pcs_co_file ** out_file)
 {
+	return pcs_co_file_pipe_ex(in_file, out_file, 0);
+}
+
+int pcs_co_file_pipe_ex(struct pcs_co_file ** in_file, struct pcs_co_file ** out_file, int pipe_for_exec)
+{
 	/* https://msdn.microsoft.com/en-us/library/windows/desktop/aa365141(v=vs.85).aspx
 	   Windows anonymous pipes cannot be used with overlapped operations.
 	   This helper function creates pipe with FILE_FLAG_OVERLAPPED set and unique name.
@@ -721,28 +928,40 @@ int pcs_co_file_pipe(struct pcs_co_file ** in_file, struct pcs_co_file ** out_fi
 		PipeSerialNumber++
 		);
 
+	SECURITY_ATTRIBUTES ReadPipeAttr = {
+		.nLength		= sizeof(ReadPipeAttr),
+		.lpSecurityDescriptor	= NULL,
+		.bInheritHandle		= (pipe_for_exec == PCS_CO_IN_PIPE_FOR_EXEC),
+	};
+
 	ReadPipeHandle = CreateNamedPipeA(
 		PipeNameBuffer,
-		PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+		PIPE_ACCESS_INBOUND | (pipe_for_exec == PCS_CO_IN_PIPE_FOR_EXEC ? 0 : FILE_FLAG_OVERLAPPED),
 		PIPE_TYPE_BYTE | PIPE_WAIT,
 		1,              // Number of pipes
 		PipeBufferSize, // Out buffer size
 		PipeBufferSize, // In buffer size
 		PipeTimeout,    // Timeout in ms
-		NULL            // Pipe attributes
+		&ReadPipeAttr   // Pipe attributes
 		);
 
 	if (!ReadPipeHandle) {
 		return -(int)GetLastError();
 	}
 
+	SECURITY_ATTRIBUTES WritePipeAttr = {
+		.nLength		= sizeof(WritePipeAttr),
+		.lpSecurityDescriptor	= NULL,
+		.bInheritHandle		= (pipe_for_exec == PCS_CO_OUT_PIPE_FOR_EXEC),
+	};
+
 	WritePipeHandle = CreateFileA(
 		PipeNameBuffer,
 		GENERIC_WRITE,
 		0,                         // No sharing
-		NULL,
+		&WritePipeAttr,
 		OPEN_EXISTING,
-		FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+		FILE_ATTRIBUTE_NORMAL | (pipe_for_exec == PCS_CO_OUT_PIPE_FOR_EXEC ? 0 : FILE_FLAG_OVERLAPPED),
 		NULL                       // Template file
 		);
 
@@ -753,8 +972,40 @@ int pcs_co_file_pipe(struct pcs_co_file ** in_file, struct pcs_co_file ** out_fi
 		return -(int)dwError;
 	}
 
-	*in_file = pcs_co_file_alloc_regular(ReadPipeHandle, O_RDONLY);
-	*out_file = pcs_co_file_alloc_regular(WritePipeHandle, O_WRONLY);
+	*in_file = (pipe_for_exec == PCS_CO_IN_PIPE_FOR_EXEC) ? pcs_co_file_alloc_dummy(ReadPipeHandle) : pcs_co_file_alloc_regular(ReadPipeHandle, O_RDONLY);
+	*out_file = (pipe_for_exec == PCS_CO_OUT_PIPE_FOR_EXEC) ? pcs_co_file_alloc_dummy(WritePipeHandle) : pcs_co_file_alloc_regular(WritePipeHandle, O_WRONLY);
+	return 0;
+}
+
+int pcs_co_open_dev_null(int flags, struct pcs_co_file ** file)
+{
+	/* convert flags and mode to CreateFile parameters */
+	DWORD access;
+	switch (flags & (_O_RDONLY | _O_WRONLY | _O_RDWR)) {
+	case _O_RDONLY:
+		access = GENERIC_READ;
+		break;
+	case _O_WRONLY:
+		access = GENERIC_WRITE;
+		break;
+	case _O_RDWR:
+		access = GENERIC_READ | GENERIC_WRITE;
+		break;
+	default:
+		return -ERROR_INVALID_PARAMETER;
+	}
+
+	SECURITY_ATTRIBUTES attr = {
+		.nLength		= sizeof(attr),
+		.lpSecurityDescriptor	= NULL,
+		.bInheritHandle		= TRUE,
+	};
+
+	HANDLE handle = CreateFileA("NUL", access, 0, &attr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (handle == INVALID_HANDLE_VALUE)
+		return -(int)GetLastError();
+
+	*file = pcs_co_file_alloc_dummy(handle);
 	return 0;
 }
 
@@ -1147,7 +1398,7 @@ static int pcs_co_connect_sa(struct sockaddr * sa, socklen_t sa_len, struct pcs_
 		if (!pcs_sock_invalid(fd))
 			break;
 
-		int err = pcs_sock_errno();
+		err = pcs_sock_errno();
 		if (pcs_fd_gc_on_error(pcs_current_proc, err, 1) <= 0)
 			return -err;
 	}
@@ -1219,7 +1470,7 @@ static int pcs_co_accept_sa(struct pcs_co_file *listen, struct sockaddr * sa, so
 		if (!pcs_sock_invalid(accepted_sock))
 			break;
 
-		int err = pcs_sock_errno();
+		err = pcs_sock_errno();
 		if (pcs_fd_gc_on_error(pcs_current_proc, err, PCS_GC_FD_ON_ACCEPT) <= 0)
 			return -err;
 	}
@@ -1297,6 +1548,16 @@ void pcs_co_file_init(struct pcs_co_file *file, struct pcs_co_file_ops *ops)
 	file->fd = PCS_INVALID_FD;
 }
 
+static struct pcs_co_file *pcs_co_file_alloc_dummy(pcs_fd_t fd)
+{
+	struct pcs_co_file *file = pcs_xzmalloc(sizeof(*file));
+
+	file->ops = &pcs_co_dummy_ops;
+	file->fd = fd;
+
+	return file;
+}
+
 static struct pcs_co_file *pcs_co_file_alloc(pcs_fd_t fd, const struct pcs_co_file_ops *ops)
 {
 	struct pcs_co_file *file = pcs_xzmalloc(sizeof(*file));
@@ -1320,7 +1581,10 @@ struct pcs_co_file *pcs_co_file_alloc_regular(pcs_fd_t fd, int flag)
 	/* Implementation of pcs_co_iocp_readv_file/pcs_co_iocp_writev_file requires that sync notifications are enabled */
 	disable_notifications(file, !preadv_supported);
 #endif
-
+#ifdef __MAC__
+	pcs_co_mutex_init(&file->wr_mutex);
+	file->wr_offs = ~0ull;
+#endif
 	return file;
 }
 
@@ -1517,6 +1781,14 @@ int pcs_co_file_writev_ex(struct pcs_co_file *file, int iovcnt, struct iovec *io
 	return __pcs_co_file_writev(file, iovcnt, iov, 0, flags);
 }
 
+int pcs_co_file_sync(struct pcs_co_file *file, u32 flags)
+{
+	if (!file->ops->sync)
+		return 0;
+
+	return file->ops->sync(file, flags);
+}
+
 /* -------------------------------------------------------------------------------------------------- */
 
 struct _co_io_req_mkdir
@@ -1540,6 +1812,30 @@ int pcs_co_mkdir(const char * pathname, int mode)
 	return pcs_co_filejob(pcs_current_proc->co_io, _co_sync_io_mkdir, &req);
 }
 
+struct _co_io_req_mkdirat
+{
+	pcs_fd_t dirfd;
+	const char * pathname;
+	int mode;
+};
+
+static int _co_sync_io_mkdirat(void * arg)
+{
+	struct _co_io_req_mkdirat * req = arg;
+	return pcs_sync_mkdirat(req->dirfd, req->pathname, req->mode);
+}
+
+int pcs_co_mkdirat(pcs_fd_t dirfd, const char * pathname, int mode)
+{
+	BUG_ON(dirfd < 0);
+	struct _co_io_req_mkdirat req = {
+		.dirfd = dirfd,
+		.pathname = pathname,
+		.mode = mode,
+	};
+	return pcs_co_filejob(pcs_current_proc->co_io, _co_sync_io_mkdirat, &req);
+}
+
 /* -------------------------------------------------------------------------------------------------- */
 
 static int _co_sync_io_rmdir(void * pathname)
@@ -1552,6 +1848,28 @@ int pcs_co_rmdir(const char * pathname)
 	return pcs_co_filejob(pcs_current_proc->co_io, _co_sync_io_rmdir, (void *)pathname);
 }
 
+struct _co_io_req_rmdirat
+{
+	pcs_fd_t dirfd;
+	const char * pathname;
+};
+
+static int _co_sync_io_rmdirat(void * arg)
+{
+	struct _co_io_req_rmdirat * req = arg;
+	return pcs_sync_rmdirat(req->dirfd, req->pathname);
+}
+
+int pcs_co_rmdirat(pcs_fd_t dirfd, const char * pathname)
+{
+	BUG_ON(dirfd < 0);
+	struct _co_io_req_rmdirat req = {
+		.dirfd = dirfd,
+		.pathname = pathname,
+	};
+	return pcs_co_filejob(pcs_current_proc->co_io, _co_sync_io_rmdirat, &req);
+}
+
 /* -------------------------------------------------------------------------------------------------- */
 
 static int _co_sync_io_unlink(void * pathname)
@@ -1562,6 +1880,30 @@ static int _co_sync_io_unlink(void * pathname)
 int pcs_co_file_unlink(const char * pathname)
 {
 	return pcs_co_filejob(pcs_current_proc->co_io, _co_sync_io_unlink, (void *)pathname);
+}
+
+struct _co_io_req_unlinkat
+{
+	pcs_fd_t dirfd;
+	const char * pathname;
+	int flags;
+};
+
+static int _co_sync_io_unlinkat(void * arg)
+{
+	struct _co_io_req_unlinkat * req = arg;
+	return pcs_sync_unlinkat(req->dirfd, req->pathname, req->flags);
+}
+
+int pcs_co_file_unlinkat(pcs_fd_t dirfd, const char * pathname, int flags)
+{
+	BUG_ON(dirfd < 0);
+	struct _co_io_req_unlinkat req = {
+		.dirfd = dirfd,
+		.pathname = pathname,
+		.flags = flags,
+	};
+	return pcs_co_filejob(pcs_current_proc->co_io, _co_sync_io_unlinkat, &req);
 }
 
 /* -------------------------------------------------------------------------------------------------- */
@@ -1585,6 +1927,35 @@ int pcs_co_file_rename(const char * oldpath, const char * newpath)
 		.newpath = newpath,
 	};
 	return pcs_co_filejob(pcs_current_proc->co_io, _co_sync_io_rename, &req);
+}
+
+/* -------------------------------------------------------------------------------------------------- */
+
+struct _co_io_req_renameat
+{
+	pcs_fd_t olddirfd;
+	const char * oldpath;
+	pcs_fd_t newdirfd;
+	const char * newpath;
+};
+
+static int _co_sync_io_renameat(void * arg)
+{
+	struct _co_io_req_renameat * req = arg;
+	return pcs_sync_renameat(req->olddirfd, req->oldpath, req->newdirfd, req->newpath);
+}
+
+int pcs_co_file_renameat(pcs_fd_t olddirfd, const char * oldpath, pcs_fd_t newdirfd, const char * newpath)
+{
+	BUG_ON(olddirfd < 0);
+	BUG_ON(newdirfd < 0);
+	struct _co_io_req_renameat req = {
+		.olddirfd = olddirfd,
+		.oldpath = oldpath,
+		.newdirfd = newdirfd,
+		.newpath = newpath,
+	};
+	return pcs_co_filejob(pcs_current_proc->co_io, _co_sync_io_renameat, &req);
 }
 
 /* -------------------------------------------------------------------------------------------------- */
@@ -1667,25 +2038,28 @@ int pcs_co_file_fallocate(pcs_fd_t fd, u64 size, u64 offset)
 
 /* -------------------------------------------------------------------------------------------------- */
 
-
-static int _co_sync_io_fsync(void * fd)
+struct _co_io_req_fsync
 {
-	return pcs_sync_fsync(*(pcs_fd_t *)fd);
+	pcs_fd_t fd;
+	u32 flags;
+};
+
+static int _co_sync_io_fsync(void * arg)
+{
+	struct _co_io_req_fsync * req = arg;
+	if (req->flags & CO_IO_DATASYNC)
+		return pcs_sync_fdatasync(req->fd);
+	else
+		return pcs_sync_fsync(req->fd);
 }
 
-int pcs_co_file_fsync(pcs_fd_t fd)
+static int pcs_co_sync_fsync(struct pcs_co_file *file, u32 flags)
 {
-	return pcs_co_filejob(pcs_current_proc->co_io, _co_sync_io_fsync, &fd);
-}
-
-static int _co_sync_io_fdatasync(void * fd)
-{
-	return pcs_sync_fdatasync(*(pcs_fd_t *)fd);
-}
-
-int pcs_co_file_fdatasync(pcs_fd_t fd)
-{
-	return pcs_co_filejob(pcs_current_proc->co_io, _co_sync_io_fdatasync, &fd);
+	struct _co_io_req_fsync req = {
+		.fd = file->fd,
+		.flags = flags,
+	};
+	return pcs_co_filejob(pcs_current_proc->co_io, _co_sync_io_fsync, &req);
 }
 
 /* -------------------------------------------------------------------------------------------------- */
@@ -1757,6 +2131,30 @@ int pcs_co_file_fstat(pcs_fd_t fd, struct pcs_stat * res)
 		.res = res,
 	};
 	return pcs_co_filejob(pcs_current_proc->co_io, _co_sync_io_fstat, &req);
+}
+
+struct _co_io_req_fstatat
+{
+	pcs_fd_t dirfd;
+	const char *filename;
+	struct pcs_stat *res;
+};
+
+static int _co_sync_io_fstatat(void * arg)
+{
+	struct _co_io_req_fstatat * req = arg;
+	return pcs_sync_fstatat(req->dirfd, req->filename, req->res);
+}
+
+int pcs_co_file_fstatat(pcs_fd_t dirfd, const char *filename, struct pcs_stat *res)
+{
+	BUG_ON(dirfd < 0);
+	struct _co_io_req_fstatat req = {
+		.dirfd = dirfd,
+		.filename = filename,
+		.res = res,
+	};
+	return pcs_co_filejob(pcs_current_proc->co_io, _co_sync_io_fstatat, &req);
 }
 
 /* -------------------------------------------------------------------------------------------------- */
@@ -1855,7 +2253,7 @@ static int pcs_co_listen_sa(struct sockaddr * sa, unsigned int sa_len, int flags
 	int val, err;
 	pcs_sock_t fd;
 
-	fd = socket(sa->sa_family, SOCK_STREAM, 0);
+	fd = pcs_new_socket(sa->sa_family, SOCK_STREAM);
 	if (pcs_sock_invalid(fd))
 		return -pcs_sock_errno();;
 
@@ -1945,6 +2343,7 @@ static const struct pcs_co_file_ops pcs_co_file_ops = {
 	.write			= pcs_co_sync_write,
 	.readv			= NULL,
 	.writev			= NULL,
+	.sync			= pcs_co_sync_fsync,
 	.close			= pcs_co_sync_close
 };
 
@@ -1954,7 +2353,19 @@ static const struct pcs_co_file_ops pcs_co_file_with_preadv_ops = {
 	.write			= pcs_co_sync_write,
 	.readv			= pcs_co_sync_readv,
 	.writev			= pcs_co_sync_writev,
+	.sync			= pcs_co_sync_fsync,
 	.close			= pcs_co_sync_close
+};
+#endif
+
+#ifdef __MAC__
+static const struct pcs_co_file_ops pcs_co_file_with_preadv_ops = {
+	.read = pcs_co_sync_read,
+	.write = pcs_co_sync_write,
+	.readv = NULL,
+	.writev = pcs_co_sync_writev,
+	.sync = pcs_co_sync_fsync,
+	.close = pcs_co_sync_close
 };
 #endif
 
@@ -1963,7 +2374,17 @@ static const struct pcs_co_file_ops pcs_co_sock_ops = {
 	.write			= pcs_co_nb_write,
 	.readv			= pcs_co_nb_readv,
 	.writev			= pcs_co_nb_writev,
+	.sync			= NULL,
 	.close			= pcs_co_nb_close
+};
+
+static const struct pcs_co_file_ops pcs_co_dummy_ops = {
+	.read			= NULL,
+	.write			= NULL,
+	.readv			= NULL,
+	.writev			= NULL,
+	.sync			= NULL,
+	.close			= pcs_dummy_close
 };
 
 #else /* __WINDOWS__ */
@@ -1973,6 +2394,7 @@ static const struct pcs_co_file_ops pcs_co_file_ops = {
 	.write			= pcs_co_iocp_write_file,
 	.readv			= NULL,
 	.writev			= NULL,
+	.sync			= pcs_co_sync_fsync,
 	.close			= pcs_co_iocp_close_file
 };
 
@@ -1981,6 +2403,7 @@ static const struct pcs_co_file_ops pcs_co_file_with_preadv_ops = {
 	.write			= pcs_co_iocp_write_file,
 	.readv			= pcs_co_iocp_readv_file,
 	.writev			= pcs_co_iocp_writev_file,
+	.sync			= pcs_co_sync_fsync,
 	.close			= pcs_co_iocp_close_file
 };
 
@@ -1989,7 +2412,17 @@ static const struct pcs_co_file_ops pcs_co_sock_ops = {
 	.write			= pcs_co_wsa_send,
 	.readv			= pcs_co_wsa_recv_v,
 	.writev			= pcs_co_wsa_send_v,
+	.sync			= NULL,
 	.close			= pcs_co_wsa_close
+};
+
+static const struct pcs_co_file_ops pcs_co_dummy_ops = {
+	.read			= NULL,
+	.write			= NULL,
+	.readv			= NULL,
+	.writev			= NULL,
+	.sync			= NULL,
+	.close			= pcs_co_iocp_close_file
 };
 
 #endif /* __WINDOWS__ */

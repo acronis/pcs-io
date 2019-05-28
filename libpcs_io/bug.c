@@ -4,10 +4,11 @@
 
 #include "log.h"
 
-#include <stdlib.h>
 #include <string.h>
 
 #include "pcs_malloc.h"
+#include "pcs_profiler.h"
+#include "pcs_atexit.h"
 
 struct bugon_exception {
 	struct bugon_exception* next;
@@ -20,6 +21,17 @@ struct bugon_exception* bugon_except_list;
 
 /* Enable debug bugons */
 int pcs_dbg_bugon_enable;
+
+void __noreturn pcs_abort(void)
+{
+	pcs_log_terminate();
+
+	/* block profiler signals to avoid truncated core dumps */
+	pcs_profiler_block(NULL, NULL);
+
+	pcs_call_atexit(exit_abort);
+	abort();
+}
 
 /* Terminate execution */
 void pcs_bug(const char *file, int line, const char *func)

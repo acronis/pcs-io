@@ -15,32 +15,8 @@
 #endif
 #endif
 
-#ifdef HAS_LINUX_SPLICE
-
-#define PCS_SPLICE_FD_LIMIT 4096
-
-struct pcs_splice_buf
-{
-	struct cd_list	list;
-	struct pcs_splice_pool * pool;
-	unsigned long	tag;
-	int		refcnt;
-	unsigned int	bytes;
-	int		desc;
-};
-
-struct pcs_splice_pool
-{
-	struct pcs_process *	proc;
-	struct pcs_fd_user	fd_user;
-
-	struct cd_list		free_list;
-	int			free_count;
-	int			total_count;
-
-	int			drain_fd;
-	int			permanently_disabled;
-};
+struct pcs_splice_buf;
+struct pcs_splice_pool;
 
 struct pcs_splice_buf * pcs_splice_buf_alloc(struct pcs_splice_pool * pool);
 void pcs_splice_bufs_destroy(struct cd_list * bufs);
@@ -73,6 +49,33 @@ void pcs_splice_pool_disable(struct pcs_splice_pool * pool);
 void pcs_splice_pool_permanently_disable(struct pcs_splice_pool * pool);
 void pcs_splice_pool_enable(struct pcs_splice_pool * pool);
 
+#ifdef HAS_LINUX_SPLICE
+
+#define PCS_SPLICE_FD_LIMIT 4096
+
+struct pcs_splice_buf
+{
+	struct cd_list	list;
+	struct pcs_splice_pool * pool;
+	ULONG_PTR	tag;
+	int		refcnt;
+	unsigned int	bytes;
+	int		desc;
+};
+
+struct pcs_splice_pool
+{
+	struct pcs_process *	proc;
+	struct pcs_fd_user	fd_user;
+
+	struct cd_list		free_list;
+	int			free_count;
+	int			total_count;
+
+	int			drain_fd;
+	int			permanently_disabled;
+};
+
 static inline struct pcs_splice_buf * pcs_splice_buf_get(struct pcs_splice_buf * b)
 {
 	b->refcnt++;
@@ -97,11 +100,26 @@ static inline int pcs_splice_buf_enabled(struct pcs_splice_pool * pool)
 
 #else /* HAS_LINUX_SPLICE */
 
-static inline struct pcs_splice_buf * pcs_splice_buf_get(struct pcs_splice_buf * b) { return b; }
-static inline void pcs_splice_buf_put(struct pcs_splice_buf * b) {}
-static inline unsigned int pcs_splice_buf_bytes(struct pcs_splice_buf * b) { return 0; }
-static inline int pcs_splice_buf_recv(struct pcs_splice_buf * b, int fd, int size) { return 0; }
-static inline int pcs_splice_buf_send(int fd, struct pcs_splice_buf * b, int size) { return 0; }
+struct pcs_splice_buf
+{
+	struct cd_list	list;
+	ULONG_PTR	tag;
+};
+
+struct pcs_splice_pool
+{
+};
+
+#define	PCS_SPLICE_FD_LIMIT	0
+
+static inline int pcs_splice_buf_enabled(struct pcs_splice_pool * pool)
+{
+	return 0;
+}
+
+struct pcs_splice_buf * pcs_splice_buf_get(struct pcs_splice_buf * b);
+void pcs_splice_buf_put(struct pcs_splice_buf * b);
+unsigned int pcs_splice_buf_bytes(struct pcs_splice_buf * b);
 
 #endif /* HAS_LINUX_SPLICE */
 

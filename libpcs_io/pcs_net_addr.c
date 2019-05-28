@@ -218,9 +218,14 @@ static int pcs_getnameinfo(const struct sockaddr *sa, socklen_t salen,
 	char *serv, size_t servlen, int flags)
 {
 	WCHAR hostw[NI_MAXHOST];
-	WCHAR servw[NI_MAXSERV];
+	WCHAR servw[NI_MAXSERV], *pservw = NULL;
+	DWORD servwlen = 0;
+	if (serv) {
+		pservw = servw;
+		servwlen = NI_MAXSERV;
+	}
 
-	if (GetNameInfoW(sa, salen, hostw, NI_MAXHOST, servw, NI_MAXSERV, flags))
+	if (GetNameInfoW(sa, salen, hostw, NI_MAXHOST, pservw, servwlen, flags))
 		return WSAGetLastError();
 
 	if (utf16_to_utf8(hostw, host, (int)hostlen) < 0)
@@ -565,7 +570,7 @@ int pcs_sockaddr2netaddr(PCS_NET_ADDR_T *addr, struct sockaddr *sa)
 	return 0;
 }
 
-int pcs_format_netaddr(char * str, int len, PCS_NET_ADDR_T const* addr)
+int pcs_format_netaddr_port(char *str, int len, unsigned *port, PCS_NET_ADDR_T const *addr)
 {
 	int fam;
 	char tmpbuf[128];
@@ -595,12 +600,26 @@ int pcs_format_netaddr(char * str, int len, PCS_NET_ADDR_T const* addr)
 #endif
 
 	const char *prefix = (addr->type == PCS_ADDRTYPE_RDMA) ? "rdma://" : "";
-	if (addr->port)
-		return snprintf(str, len, "%s%s%s%s:%u", prefix, fam == AF_INET6 ? "[" : "",
-			tmpbuf, fam == AF_INET6 ? "]" : "", ntohs((u16)addr->port));
-	else
-		return snprintf(str, len, "%s%s%s%s", prefix, fam == AF_INET6 ? "[" : "",
-			tmpbuf, fam == AF_INET6 ? "]" : "");
+	if (port)
+		*port = ntohs((u16)addr->port);
+	return snprintf(str, len, "%s%s%s%s", prefix,
+			fam == AF_INET6 ? "[" : "",
+			tmpbuf,
+			fam == AF_INET6 ? "]" : "");
+}
+
+int pcs_format_netaddr(char * str, int len, PCS_NET_ADDR_T const* addr)
+{
+	int ret, ret2 = 0;
+	unsigned port;
+
+	ret = pcs_format_netaddr_port(str, len, &port, addr);
+	if (ret < 0 || ret >= len || !port)
+		return ret;
+	ret2 = snprintf(str + ret, len - ret, ":%u", port);
+	if (ret2 < 0)
+		return ret2;
+	return ret + ret2;
 }
 
 static inline int netaddr_cmp(PCS_NET_ADDR_T const* addr1, PCS_NET_ADDR_T const* addr2, int ignore_port)

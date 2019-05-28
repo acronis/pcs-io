@@ -1,0 +1,1466 @@
+commit d0fb5d8b00ab4c9de7a610099b0f2e88bea6f917
+Author: Dmitry Vyukov <dvyukov@google.com>
+Date:   Wed Nov 21 09:31:21 2018 +0000
+
+    tsan: add pthread_tryjoin_np and pthread_timedjoin_np interceptors
+    
+    Add pthread_tryjoin_np() and pthread_timedjoin_np() interceptors on Linux,
+    so that ThreadSanitizer can handle programs using these functions.
+    
+    Author: Yuri Per (yuri)
+    Reviewed in: https://reviews.llvm.org/D54521
+    
+    llvm-svn: 347383
+
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_thread_registry.cc b/compiler-rt/lib/sanitizer_common/sanitizer_thread_registry.cc
+index d9fd6549ba4..eb35cb6c583 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_thread_registry.cc
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_thread_registry.cc
+@@ -338,4 +338,15 @@ ThreadContextBase *ThreadRegistry::QuarantinePop() {
+   return tctx;
+ }
+ 
++void ThreadRegistry::SetThreadUserId(u32 tid, uptr user_id) {
++  BlockingMutexLock l(&mtx_);
++  CHECK_LT(tid, n_contexts_);
++  ThreadContextBase *tctx = threads_[tid];
++  CHECK_NE(tctx, 0);
++  CHECK_NE(tctx->status, ThreadStatusInvalid);
++  CHECK_NE(tctx->status, ThreadStatusDead);
++  CHECK_EQ(tctx->user_id, 0);
++  tctx->user_id = user_id;
++}
++
+ }  // namespace __sanitizer
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_thread_registry.h b/compiler-rt/lib/sanitizer_common/sanitizer_thread_registry.h
+index b203be2f4db..30dc603febd 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_thread_registry.h
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_thread_registry.h
+@@ -122,6 +122,7 @@ class ThreadRegistry {
+   void JoinThread(u32 tid, void *arg);
+   void FinishThread(u32 tid);
+   void StartThread(u32 tid, tid_t os_id, bool workerthread, void *arg);
++  void SetThreadUserId(u32 tid, uptr user_id);
+ 
+  private:
+   const ThreadContextFactory context_factory_;
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_interceptors.cc b/compiler-rt/lib/tsan/rtl/tsan_interceptors.cc
+index 801478a0015..cc6dab8f1ce 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_interceptors.cc
++++ b/compiler-rt/lib/tsan/rtl/tsan_interceptors.cc
+@@ -1056,6 +1056,35 @@ TSAN_INTERCEPTOR(int, pthread_detach, void *th) {
+   return res;
+ }
+ 
++#if SANITIZER_LINUX
++TSAN_INTERCEPTOR(int, pthread_tryjoin_np, void *th, void **ret) {
++  SCOPED_TSAN_INTERCEPTOR(pthread_tryjoin_np, th, ret);
++  int tid = ThreadTid(thr, pc, (uptr)th);
++  ThreadIgnoreBegin(thr, pc);
++  int res = REAL(pthread_tryjoin_np)(th, ret);
++  ThreadIgnoreEnd(thr, pc);
++  if (res == 0)
++    ThreadJoin(thr, pc, tid);
++  else
++    ThreadNotJoined(thr, pc, tid, (uptr)th);
++  return res;
++}
++
++TSAN_INTERCEPTOR(int, pthread_timedjoin_np, void *th, void **ret,
++                 const struct timespec *abstime) {
++  SCOPED_TSAN_INTERCEPTOR(pthread_timedjoin_np, th, ret, abstime);
++  int tid = ThreadTid(thr, pc, (uptr)th);
++  ThreadIgnoreBegin(thr, pc);
++  int res = BLOCK_REAL(pthread_timedjoin_np)(th, ret, abstime);
++  ThreadIgnoreEnd(thr, pc);
++  if (res == 0)
++    ThreadJoin(thr, pc, tid);
++  else
++    ThreadNotJoined(thr, pc, tid, (uptr)th);
++  return res;
++}
++#endif
++
+ // Problem:
+ // NPTL implementation of pthread_cond has 2 versions (2.2.5 and 2.3.2).
+ // pthread_cond_t has different size in the different versions.
+@@ -2652,6 +2681,10 @@ void InitializeInterceptors() {
+   TSAN_INTERCEPT(pthread_create);
+   TSAN_INTERCEPT(pthread_join);
+   TSAN_INTERCEPT(pthread_detach);
++  #if SANITIZER_LINUX
++  TSAN_INTERCEPT(pthread_tryjoin_np);
++  TSAN_INTERCEPT(pthread_timedjoin_np);
++  #endif
+ 
+   TSAN_INTERCEPT_VER(pthread_cond_init, PTHREAD_ABI_BASE);
+   TSAN_INTERCEPT_VER(pthread_cond_signal, PTHREAD_ABI_BASE);
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_rtl.h b/compiler-rt/lib/tsan/rtl/tsan_rtl.h
+index 523b69aaa6b..7d4c53ec2fd 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_rtl.h
++++ b/compiler-rt/lib/tsan/rtl/tsan_rtl.h
+@@ -772,6 +772,7 @@ void ThreadFinalize(ThreadState *thr);
+ void ThreadSetName(ThreadState *thr, const char *name);
+ int ThreadCount(ThreadState *thr);
+ void ProcessPendingSignals(ThreadState *thr);
++void ThreadNotJoined(ThreadState *thr, uptr pc, int tid, uptr uid);
+ 
+ Processor *ProcCreate();
+ void ProcDestroy(Processor *proc);
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_rtl_thread.cc b/compiler-rt/lib/tsan/rtl/tsan_rtl_thread.cc
+index e4d65b9a909..766a0f5a505 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_rtl_thread.cc
++++ b/compiler-rt/lib/tsan/rtl/tsan_rtl_thread.cc
+@@ -312,6 +312,12 @@ void ThreadDetach(ThreadState *thr, uptr pc, int tid) {
+   ctx->thread_registry->DetachThread(tid, thr);
+ }
+ 
++void ThreadNotJoined(ThreadState *thr, uptr pc, int tid, uptr uid) {
++  CHECK_GT(tid, 0);
++  CHECK_LT(tid, kMaxTid);
++  ctx->thread_registry->SetThreadUserId(tid, uid);
++}
++
+ void ThreadSetName(ThreadState *thr, const char *name) {
+   ctx->thread_registry->SetThreadName(thr->tid, name);
+ }
+
+commit baf2f35ec4c5adeaab2a51b2e6c5eb6156f82575
+Author: Dmitry Vyukov <dvyukov@google.com>
+Date:   Thu Feb 7 11:01:22 2019 +0000
+
+    sanitizers: Introduce ThreadType enum
+    
+    Replace bool workerthread flag with ThreadType enum.
+    This change is preparation for fiber support.
+    
+    [dvyukov: fixed build of sanitizer_thread_registry_test.cc]
+    
+    Author: yuri (Yuri Per)
+    Reviewed in: https://reviews.llvm.org/D57839
+    Context: https://reviews.llvm.org/D54889
+    
+    llvm-svn: 353390
+
+diff --git a/compiler-rt/lib/asan/asan_fuchsia.cc b/compiler-rt/lib/asan/asan_fuchsia.cc
+index e333b7b0f40..aebc17f38b4 100644
+--- a/compiler-rt/lib/asan/asan_fuchsia.cc
++++ b/compiler-rt/lib/asan/asan_fuchsia.cc
+@@ -178,7 +178,7 @@ static void ThreadStartHook(void *hook, uptr os_id) {
+   SetCurrentThread(thread);
+ 
+   // In lieu of AsanThread::ThreadStart.
+-  asanThreadRegistry().StartThread(thread->tid(), os_id, /*workerthread*/ false,
++  asanThreadRegistry().StartThread(thread->tid(), os_id, ThreadType::Regular,
+                                    nullptr);
+ }
+ 
+diff --git a/compiler-rt/lib/asan/asan_mac.cc b/compiler-rt/lib/asan/asan_mac.cc
+index 7bb7c2bdd21..e776acd2f53 100644
+--- a/compiler-rt/lib/asan/asan_mac.cc
++++ b/compiler-rt/lib/asan/asan_mac.cc
+@@ -181,8 +181,8 @@ void asan_register_worker_thread(int parent_tid, StackTrace *stack) {
+     t = AsanThread::Create(/* start_routine */ nullptr, /* arg */ nullptr,
+                            parent_tid, stack, /* detached */ true);
+     t->Init();
+-    asanThreadRegistry().StartThread(t->tid(), GetTid(),
+-                                     /* workerthread */ true, 0);
++    asanThreadRegistry().StartThread(t->tid(), GetTid(), ThreadType::Worker,
++                                     nullptr);
+     SetCurrentThread(t);
+   }
+ }
+diff --git a/compiler-rt/lib/asan/asan_rtems.cc b/compiler-rt/lib/asan/asan_rtems.cc
+index a76a32bda59..4878f4d67c8 100644
+--- a/compiler-rt/lib/asan/asan_rtems.cc
++++ b/compiler-rt/lib/asan/asan_rtems.cc
+@@ -183,8 +183,8 @@ static void ThreadStartHook(void *hook, uptr os_id) {
+   // Determine whether we are starting or restarting the thread.
+   if (status == ThreadStatusCreated)
+     // In lieu of AsanThread::ThreadStart.
+-    asanThreadRegistry().StartThread(thread->tid(), os_id,
+-                                     /*workerthread*/ false, nullptr);
++    asanThreadRegistry().StartThread(thread->tid(), os_id, ThreadType::Regular,
++                                     nullptr);
+   else {
+     // In a thread restart, a thread may resume execution at an
+     // arbitrary function entry point, with its stack and TLS state
+diff --git a/compiler-rt/lib/asan/asan_thread.cc b/compiler-rt/lib/asan/asan_thread.cc
+index 8a28529807f..e63561c2243 100644
+--- a/compiler-rt/lib/asan/asan_thread.cc
++++ b/compiler-rt/lib/asan/asan_thread.cc
+@@ -245,8 +245,7 @@ void AsanThread::Init(const InitOptions *options) {
+ thread_return_t AsanThread::ThreadStart(
+     tid_t os_id, atomic_uintptr_t *signal_thread_is_registered) {
+   Init();
+-  asanThreadRegistry().StartThread(tid(), os_id, /*workerthread*/ false,
+-                                   nullptr);
++  asanThreadRegistry().StartThread(tid(), os_id, ThreadType::Regular, nullptr);
+   if (signal_thread_is_registered)
+     atomic_store(signal_thread_is_registered, 1, memory_order_release);
+ 
+diff --git a/compiler-rt/lib/lsan/lsan_thread.cc b/compiler-rt/lib/lsan/lsan_thread.cc
+index a0b7bb2ffcd..77f6a9236dd 100644
+--- a/compiler-rt/lib/lsan/lsan_thread.cc
++++ b/compiler-rt/lib/lsan/lsan_thread.cc
+@@ -76,7 +76,7 @@ u32 ThreadCreate(u32 parent_tid, uptr user_id, bool detached) {
+                                        /* arg */ nullptr);
+ }
+ 
+-void ThreadStart(u32 tid, tid_t os_id, bool workerthread) {
++void ThreadStart(u32 tid, tid_t os_id, ThreadType thread_type) {
+   OnStartedArgs args;
+   uptr stack_size = 0;
+   uptr tls_size = 0;
+@@ -86,7 +86,7 @@ void ThreadStart(u32 tid, tid_t os_id, bool workerthread) {
+   args.tls_end = args.tls_begin + tls_size;
+   GetAllocatorCacheRange(&args.cache_begin, &args.cache_end);
+   args.dtls = DTLS_Get();
+-  thread_registry->StartThread(tid, os_id, workerthread, &args);
++  thread_registry->StartThread(tid, os_id, thread_type, &args);
+ }
+ 
+ void ThreadFinish() {
+diff --git a/compiler-rt/lib/lsan/lsan_thread.h b/compiler-rt/lib/lsan/lsan_thread.h
+index 92db62759fe..b869d066d9d 100644
+--- a/compiler-rt/lib/lsan/lsan_thread.h
++++ b/compiler-rt/lib/lsan/lsan_thread.h
+@@ -44,7 +44,8 @@ class ThreadContext : public ThreadContextBase {
+ 
+ void InitializeThreadRegistry();
+ 
+-void ThreadStart(u32 tid, tid_t os_id, bool workerthread = false);
++void ThreadStart(u32 tid, tid_t os_id,
++                 ThreadType thread_type = ThreadType::Regular);
+ void ThreadFinish();
+ u32 ThreadCreate(u32 tid, uptr uid, bool detached);
+ void ThreadJoin(u32 tid);
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_thread_registry.cc b/compiler-rt/lib/sanitizer_common/sanitizer_thread_registry.cc
+index cfc9e913522..02691287d76 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_thread_registry.cc
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_thread_registry.cc
+@@ -17,8 +17,8 @@ namespace __sanitizer {
+ 
+ ThreadContextBase::ThreadContextBase(u32 tid)
+     : tid(tid), unique_id(0), reuse_count(), os_id(0), user_id(0),
+-      status(ThreadStatusInvalid),
+-      detached(false), workerthread(false), parent_tid(0), next(0) {
++      status(ThreadStatusInvalid), detached(false),
++      thread_type(ThreadType::Regular), parent_tid(0), next(0) {
+   name[0] = '\0';
+   atomic_store(&thread_destroyed, 0, memory_order_release);
+ }
+@@ -70,11 +70,11 @@ void ThreadContextBase::SetFinished() {
+   OnFinished();
+ }
+ 
+-void ThreadContextBase::SetStarted(tid_t _os_id, bool _workerthread,
++void ThreadContextBase::SetStarted(tid_t _os_id, ThreadType _thread_type,
+                                    void *arg) {
+   status = ThreadStatusRunning;
+   os_id = _os_id;
+-  workerthread = _workerthread;
++  thread_type = _thread_type;
+   OnStarted(arg);
+ }
+ 
+@@ -302,7 +302,7 @@ void ThreadRegistry::FinishThread(u32 tid) {
+   tctx->SetDestroyed();
+ }
+ 
+-void ThreadRegistry::StartThread(u32 tid, tid_t os_id, bool workerthread,
++void ThreadRegistry::StartThread(u32 tid, tid_t os_id, ThreadType thread_type,
+                                  void *arg) {
+   BlockingMutexLock l(&mtx_);
+   running_threads_++;
+@@ -310,7 +310,7 @@ void ThreadRegistry::StartThread(u32 tid, tid_t os_id, bool workerthread,
+   ThreadContextBase *tctx = threads_[tid];
+   CHECK_NE(tctx, 0);
+   CHECK_EQ(ThreadStatusCreated, tctx->status);
+-  tctx->SetStarted(os_id, workerthread, arg);
++  tctx->SetStarted(os_id, thread_type, arg);
+ }
+ 
+ void ThreadRegistry::QuarantinePush(ThreadContextBase *tctx) {
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_thread_registry.h b/compiler-rt/lib/sanitizer_common/sanitizer_thread_registry.h
+index 3b2aa8767c3..fc38d0f80d2 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_thread_registry.h
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_thread_registry.h
+@@ -28,6 +28,11 @@ enum ThreadStatus {
+   ThreadStatusDead       // Joined, but some info is still available.
+ };
+ 
++enum class ThreadType {
++  Regular, // Normal thread
++  Worker,  // macOS Grand Central Dispatch (GCD) worker thread
++};
++
+ // Generic thread context. Specific sanitizer tools may inherit from it.
+ // If thread is dead, context may optionally be reused for a new thread.
+ class ThreadContextBase {
+@@ -44,7 +49,7 @@ class ThreadContextBase {
+ 
+   ThreadStatus status;
+   bool detached;
+-  bool workerthread;
++  ThreadType thread_type;
+ 
+   u32 parent_tid;
+   ThreadContextBase *next;  // For storing thread contexts in a list.
+@@ -56,7 +61,7 @@ class ThreadContextBase {
+   void SetDead();
+   void SetJoined(void *arg);
+   void SetFinished();
+-  void SetStarted(tid_t _os_id, bool _workerthread, void *arg);
++  void SetStarted(tid_t _os_id, ThreadType _thread_type, void *arg);
+   void SetCreated(uptr _user_id, u64 _unique_id, bool _detached,
+                   u32 _parent_tid, void *arg);
+   void Reset();
+@@ -120,7 +125,7 @@ class ThreadRegistry {
+   void DetachThread(u32 tid, void *arg);
+   void JoinThread(u32 tid, void *arg);
+   void FinishThread(u32 tid);
+-  void StartThread(u32 tid, tid_t os_id, bool workerthread, void *arg);
++  void StartThread(u32 tid, tid_t os_id, ThreadType thread_type, void *arg);
+   void SetThreadUserId(u32 tid, uptr user_id);
+ 
+  private:
+diff --git a/compiler-rt/lib/sanitizer_common/tests/sanitizer_thread_registry_test.cc b/compiler-rt/lib/sanitizer_common/tests/sanitizer_thread_registry_test.cc
+index de41303fb5c..09c01d6c8f4 100644
+--- a/compiler-rt/lib/sanitizer_common/tests/sanitizer_thread_registry_test.cc
++++ b/compiler-rt/lib/sanitizer_common/tests/sanitizer_thread_registry_test.cc
+@@ -66,7 +66,7 @@ static void MarkUidAsPresent(ThreadContextBase *tctx, void *arg) {
+ static void TestRegistry(ThreadRegistry *registry, bool has_quarantine) {
+   // Create and start a main thread.
+   EXPECT_EQ(0U, registry->CreateThread(get_uid(0), true, -1, 0));
+-  registry->StartThread(0, 0, false, 0);
++  registry->StartThread(0, 0, ThreadType::Regular, 0);
+   // Create a bunch of threads.
+   for (u32 i = 1; i <= 10; i++) {
+     EXPECT_EQ(i, registry->CreateThread(get_uid(i), is_detached(i), 0, 0));
+@@ -74,7 +74,7 @@ static void TestRegistry(ThreadRegistry *registry, bool has_quarantine) {
+   CheckThreadQuantity(registry, 11, 1, 11);
+   // Start some of them.
+   for (u32 i = 1; i <= 5; i++) {
+-    registry->StartThread(i, 0, false, 0);
++    registry->StartThread(i, 0, ThreadType::Regular, 0);
+   }
+   CheckThreadQuantity(registry, 11, 6, 11);
+   // Finish, create and start more threads.
+@@ -84,7 +84,7 @@ static void TestRegistry(ThreadRegistry *registry, bool has_quarantine) {
+       registry->JoinThread(i, 0);
+   }
+   for (u32 i = 6; i <= 10; i++) {
+-    registry->StartThread(i, 0, false, 0);
++    registry->StartThread(i, 0, ThreadType::Regular, 0);
+   }
+   std::vector<u32> new_tids;
+   for (u32 i = 11; i <= 15; i++) {
+@@ -111,7 +111,7 @@ static void TestRegistry(ThreadRegistry *registry, bool has_quarantine) {
+   }
+   for (u32 i = 0; i < new_tids.size(); i++) {
+     u32 tid = new_tids[i];
+-    registry->StartThread(tid, 0, false, 0);
++    registry->StartThread(tid, 0, ThreadType::Regular, 0);
+     registry->DetachThread(tid, 0);
+     registry->FinishThread(tid);
+   }
+@@ -188,7 +188,8 @@ void *RunThread(void *arg) {
+     tids.push_back(
+         args->registry->CreateThread(0, false, 0, (void*)args->shard));
+   for (int i = 0; i < kThreadsPerShard; i++)
+-    args->registry->StartThread(tids[i], 0, false, (void*)args->shard);
++    args->registry->StartThread(tids[i], 0, ThreadType::Regular,
++        (void*)args->shard);
+   for (int i = 0; i < kThreadsPerShard; i++)
+     args->registry->FinishThread(tids[i]);
+   for (int i = 0; i < kThreadsPerShard; i++)
+@@ -199,7 +200,7 @@ void *RunThread(void *arg) {
+ static void ThreadedTestRegistry(ThreadRegistry *registry) {
+   // Create and start a main thread.
+   EXPECT_EQ(0U, registry->CreateThread(0, true, -1, 0));
+-  registry->StartThread(0, 0, false, 0);
++  registry->StartThread(0, 0, ThreadType::Regular, 0);
+   pthread_t threads[kNumShards];
+   RunThreadArgs args[kNumShards];
+   for (int i = 0; i < kNumShards; i++) {
+diff --git a/compiler-rt/lib/tsan/go/tsan_go.cc b/compiler-rt/lib/tsan/go/tsan_go.cc
+index 825344ff735..dfd1e1da158 100644
+--- a/compiler-rt/lib/tsan/go/tsan_go.cc
++++ b/compiler-rt/lib/tsan/go/tsan_go.cc
+@@ -213,7 +213,7 @@ void __tsan_go_start(ThreadState *parent, ThreadState **pthr, void *pc) {
+   ThreadState *thr = AllocGoroutine();
+   *pthr = thr;
+   int goid = ThreadCreate(parent, (uptr)pc, 0, true);
+-  ThreadStart(thr, goid, 0, /*workerthread*/ false);
++  ThreadStart(thr, goid, 0, ThreadType::Regular);
+ }
+ 
+ void __tsan_go_end(ThreadState *thr) {
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_interceptors.cc b/compiler-rt/lib/tsan/rtl/tsan_interceptors.cc
+index 6070b59755a..c6852e4b612 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_interceptors.cc
++++ b/compiler-rt/lib/tsan/rtl/tsan_interceptors.cc
+@@ -958,7 +958,7 @@ extern "C" void *__tsan_thread_start_func(void *arg) {
+       internal_sched_yield();
+     Processor *proc = ProcCreate();
+     ProcWire(proc, thr);
+-    ThreadStart(thr, tid, GetTid(), /*workerthread*/ false);
++    ThreadStart(thr, tid, GetTid(), ThreadType::Regular);
+     atomic_store(&p->tid, 0, memory_order_release);
+   }
+   void *res = callback(param);
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_platform_mac.cc b/compiler-rt/lib/tsan/rtl/tsan_platform_mac.cc
+index ddf38e2eceb..b832d22d1a3 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_platform_mac.cc
++++ b/compiler-rt/lib/tsan/rtl/tsan_platform_mac.cc
+@@ -212,7 +212,7 @@ static void my_pthread_introspection_hook(unsigned int event, pthread_t thread,
+       ThreadState *parent_thread_state = nullptr;  // No parent.
+       int tid = ThreadCreate(parent_thread_state, 0, (uptr)thread, true);
+       CHECK_NE(tid, 0);
+-      ThreadStart(thr, tid, GetTid(), /*workerthread*/ true);
++      ThreadStart(thr, tid, GetTid(), ThreadType::Worker);
+     }
+   } else if (event == PTHREAD_INTROSPECTION_THREAD_TERMINATE) {
+     if (thread == pthread_self()) {
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_report.cc b/compiler-rt/lib/tsan/rtl/tsan_report.cc
+index 37dd1dcb39f..ae669024a87 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_report.cc
++++ b/compiler-rt/lib/tsan/rtl/tsan_report.cc
+@@ -257,7 +257,7 @@ static void PrintThread(const ReportThread *rt) {
+     Printf(" '%s'", rt->name);
+   char thrbuf[kThreadBufSize];
+   const char *thread_status = rt->running ? "running" : "finished";
+-  if (rt->workerthread) {
++  if (rt->thread_type == ThreadType::Worker) {
+     Printf(" (tid=%zu, %s) is a GCD worker thread\n", rt->os_id, thread_status);
+     Printf("\n");
+     Printf("%s", d.Default());
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_report.h b/compiler-rt/lib/tsan/rtl/tsan_report.h
+index 3e83c13907d..b4e4d898937 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_report.h
++++ b/compiler-rt/lib/tsan/rtl/tsan_report.h
+@@ -13,6 +13,7 @@
+ #define TSAN_REPORT_H
+ 
+ #include "sanitizer_common/sanitizer_symbolizer.h"
++#include "sanitizer_common/sanitizer_thread_registry.h"
+ #include "sanitizer_common/sanitizer_vector.h"
+ #include "tsan_defs.h"
+ 
+@@ -91,7 +92,7 @@ struct ReportThread {
+   int id;
+   tid_t os_id;
+   bool running;
+-  bool workerthread;
++  ThreadType thread_type;
+   char *name;
+   u32 parent_tid;
+   ReportStack *stack;
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_rtl.cc b/compiler-rt/lib/tsan/rtl/tsan_rtl.cc
+index dbae4a258d7..a7c5db77be5 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_rtl.cc
++++ b/compiler-rt/lib/tsan/rtl/tsan_rtl.cc
+@@ -396,7 +396,7 @@ void Initialize(ThreadState *thr) {
+   // Initialize thread 0.
+   int tid = ThreadCreate(thr, 0, 0, true);
+   CHECK_EQ(tid, 0);
+-  ThreadStart(thr, tid, GetTid(), /*workerthread*/ false);
++  ThreadStart(thr, tid, GetTid(), ThreadType::Regular);
+ #if TSAN_CONTAINS_UBSAN
+   __ubsan::InitAsPlugin();
+ #endif
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_rtl.h b/compiler-rt/lib/tsan/rtl/tsan_rtl.h
+index c57d8d9d5de..37ca731e923 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_rtl.h
++++ b/compiler-rt/lib/tsan/rtl/tsan_rtl.h
+@@ -764,7 +764,8 @@ void FuncEntry(ThreadState *thr, uptr pc);
+ void FuncExit(ThreadState *thr);
+ 
+ int ThreadCreate(ThreadState *thr, uptr pc, uptr uid, bool detached);
+-void ThreadStart(ThreadState *thr, int tid, tid_t os_id, bool workerthread);
++void ThreadStart(ThreadState *thr, int tid, tid_t os_id,
++                 ThreadType thread_type);
+ void ThreadFinish(ThreadState *thr);
+ int ThreadTid(ThreadState *thr, uptr pc, uptr uid);
+ void ThreadJoin(ThreadState *thr, uptr pc, int tid);
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_rtl_report.cc b/compiler-rt/lib/tsan/rtl/tsan_rtl_report.cc
+index 40fd7f7c207..0a1f2284bfb 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_rtl_report.cc
++++ b/compiler-rt/lib/tsan/rtl/tsan_rtl_report.cc
+@@ -201,7 +201,7 @@ void ScopedReportBase::AddThread(const ThreadContext *tctx, bool suppressable) {
+   rt->running = (tctx->status == ThreadStatusRunning);
+   rt->name = internal_strdup(tctx->name);
+   rt->parent_tid = tctx->parent_tid;
+-  rt->workerthread = tctx->workerthread;
++  rt->thread_type = tctx->thread_type;
+   rt->stack = 0;
+   rt->stack = SymbolizeStackId(tctx->creation_stack_id);
+   if (rt->stack)
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_rtl_thread.cc b/compiler-rt/lib/tsan/rtl/tsan_rtl_thread.cc
+index 53cc81cf207..de429a553d1 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_rtl_thread.cc
++++ b/compiler-rt/lib/tsan/rtl/tsan_rtl_thread.cc
+@@ -239,7 +239,8 @@ int ThreadCreate(ThreadState *thr, uptr pc, uptr uid, bool detached) {
+   return tid;
+ }
+ 
+-void ThreadStart(ThreadState *thr, int tid, tid_t os_id, bool workerthread) {
++void ThreadStart(ThreadState *thr, int tid, tid_t os_id,
++                 ThreadType thread_type) {
+   uptr stk_addr = 0;
+   uptr stk_size = 0;
+   uptr tls_addr = 0;
+@@ -257,7 +258,7 @@ void ThreadStart(ThreadState *thr, int tid, tid_t os_id, bool workerthread) {
+ 
+   ThreadRegistry *tr = ctx->thread_registry;
+   OnStartedArgs args = { thr, stk_addr, stk_size, tls_addr, tls_size };
+-  tr->StartThread(tid, os_id, workerthread, &args);
++  tr->StartThread(tid, os_id, thread_type, &args);
+ 
+   tr->Lock();
+   thr->tctx = (ThreadContext*)tr->GetThreadLocked(tid);
+
+commit fddaf1f369a12925456508eb9157691abe65d8ab
+Author: Dmitry Vyukov <dvyukov@google.com>
+Date:   Thu Feb 7 12:43:09 2019 +0000
+
+    tsan: Optimize performance of Thread sanitizer memory access functions
+    
+    - Manually unwind code in MemoryAccessImpl1() because clang do not optimize it
+    - Check for .rodata section only in read operations
+    - Place LIKELY/UNLIKELY on fast paths
+    
+    This speeds up synthetic memory access benchmarks by 10-20%.
+    
+    [dvyukov: fixed up consts in check_analyze.sh]
+    
+    Author: yuri (Yuri Per)
+    Reviewed in: https://reviews.llvm.org/D57882
+    Context: https://reviews.llvm.org/D54889
+    
+    llvm-svn: 353401
+
+diff --git a/compiler-rt/lib/tsan/check_analyze.sh b/compiler-rt/lib/tsan/check_analyze.sh
+index 65c34d466da..5e7a9a96742 100755
+--- a/compiler-rt/lib/tsan/check_analyze.sh
++++ b/compiler-rt/lib/tsan/check_analyze.sh
+@@ -34,16 +34,22 @@ check() {
+   fi
+ }
+ 
+-for f in write1 write2 write4 write8 read2 read4; do
++for f in write1 write2 write4 write8; do
+   check $f rsp 1
+   check $f push 1
+-  check $f pop 6
++  check $f pop 8
+ done
+ 
+-for f in read1 read8; do
++for f in read1; do
+   check $f rsp 1
+   check $f push 2
+-  check $f pop 12
++  check $f pop 16
++done
++
++for f in read2 read4 read8; do
++  check $f rsp 1
++  check $f push 3
++  check $f pop 24
+ done
+ 
+ for f in func_entry func_exit; do
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_interface_atomic.cc b/compiler-rt/lib/tsan/rtl/tsan_interface_atomic.cc
+index 8dc9f77312e..a6b7b0f656d 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_interface_atomic.cc
++++ b/compiler-rt/lib/tsan/rtl/tsan_interface_atomic.cc
+@@ -474,7 +474,7 @@ static morder convert_morder(morder mo) {
+ 
+ #define SCOPED_ATOMIC(func, ...) \
+     ThreadState *const thr = cur_thread(); \
+-    if (thr->ignore_sync || thr->ignore_interceptors) { \
++    if (UNLIKELY(thr->ignore_sync || thr->ignore_interceptors)) { \
+       ProcessPendingSignals(thr); \
+       return NoTsanAtomic##func(__VA_ARGS__); \
+     } \
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_rtl.cc b/compiler-rt/lib/tsan/rtl/tsan_rtl.cc
+index a7c5db77be5..6b03ad543c6 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_rtl.cc
++++ b/compiler-rt/lib/tsan/rtl/tsan_rtl.cc
+@@ -641,6 +641,7 @@ void MemoryAccessImpl1(ThreadState *thr, uptr addr,
+   // __m128i _mm_move_epi64(__m128i*);
+   // _mm_storel_epi64(u64*, __m128i);
+   u64 store_word = cur.raw();
++  bool stored = false;
+ 
+   // scan all the shadow values and dispatch to 4 categories:
+   // same, replace, candidate and race (see comments below).
+@@ -665,16 +666,28 @@ void MemoryAccessImpl1(ThreadState *thr, uptr addr,
+   int idx = 0;
+ #include "tsan_update_shadow_word_inl.h"
+   idx = 1;
++  if (stored) {
+ #include "tsan_update_shadow_word_inl.h"
++  } else {
++#include "tsan_update_shadow_word_inl.h"
++  }
+   idx = 2;
++  if (stored) {
++#include "tsan_update_shadow_word_inl.h"
++  } else {
+ #include "tsan_update_shadow_word_inl.h"
++  }
+   idx = 3;
++  if (stored) {
++#include "tsan_update_shadow_word_inl.h"
++  } else {
+ #include "tsan_update_shadow_word_inl.h"
++  }
+ #endif
+ 
+   // we did not find any races and had already stored
+   // the current access info, so we are done
+-  if (LIKELY(store_word == 0))
++  if (LIKELY(stored))
+     return;
+   // choose a random candidate slot and replace it
+   StoreShadow(shadow_mem + (cur.epoch() % kShadowCnt), store_word);
+@@ -814,7 +827,7 @@ void MemoryAccess(ThreadState *thr, uptr pc, uptr addr,
+   }
+ #endif
+ 
+-  if (!SANITIZER_GO && *shadow_mem == kShadowRodata) {
++  if (!SANITIZER_GO && !kAccessIsWrite && *shadow_mem == kShadowRodata) {
+     // Access to .rodata section, no races here.
+     // Measurements show that it can be 10-20% of all memory accesses.
+     StatInc(thr, StatMop);
+@@ -825,7 +838,7 @@ void MemoryAccess(ThreadState *thr, uptr pc, uptr addr,
+   }
+ 
+   FastState fast_state = thr->fast_state;
+-  if (fast_state.GetIgnoreBit()) {
++  if (UNLIKELY(fast_state.GetIgnoreBit())) {
+     StatInc(thr, StatMop);
+     StatInc(thr, kAccessIsWrite ? StatMopWrite : StatMopRead);
+     StatInc(thr, (StatType)(StatMop1 + kAccessSizeLog));
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_update_shadow_word_inl.h b/compiler-rt/lib/tsan/rtl/tsan_update_shadow_word_inl.h
+index a106f557358..056c3aa2032 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_update_shadow_word_inl.h
++++ b/compiler-rt/lib/tsan/rtl/tsan_update_shadow_word_inl.h
+@@ -17,31 +17,35 @@ do {
+   const unsigned kAccessSize = 1 << kAccessSizeLog;
+   u64 *sp = &shadow_mem[idx];
+   old = LoadShadow(sp);
+-  if (old.IsZero()) {
++  if (LIKELY(old.IsZero())) {
+     StatInc(thr, StatShadowZero);
+-    if (store_word)
++    if (!stored) {
+       StoreIfNotYetStored(sp, &store_word);
+-    // The above StoreIfNotYetStored could be done unconditionally
+-    // and it even shows 4% gain on synthetic benchmarks (r4307).
++      stored = true;
++    }
+     break;
+   }
+   // is the memory access equal to the previous?
+-  if (Shadow::Addr0AndSizeAreEqual(cur, old)) {
++  if (LIKELY(Shadow::Addr0AndSizeAreEqual(cur, old))) {
+     StatInc(thr, StatShadowSameSize);
+     // same thread?
+-    if (Shadow::TidsAreEqual(old, cur)) {
++    if (LIKELY(Shadow::TidsAreEqual(old, cur))) {
+       StatInc(thr, StatShadowSameThread);
+-      if (old.IsRWWeakerOrEqual(kAccessIsWrite, kIsAtomic))
++      if (LIKELY(old.IsRWWeakerOrEqual(kAccessIsWrite, kIsAtomic))) {
+         StoreIfNotYetStored(sp, &store_word);
++        stored = true;
++      }
+       break;
+     }
+     StatInc(thr, StatShadowAnotherThread);
+     if (HappensBefore(old, thr)) {
+-      if (old.IsRWWeakerOrEqual(kAccessIsWrite, kIsAtomic))
++      if (old.IsRWWeakerOrEqual(kAccessIsWrite, kIsAtomic)) {
+         StoreIfNotYetStored(sp, &store_word);
++        stored = true;
++      }
+       break;
+     }
+-    if (old.IsBothReadsOrAtomic(kAccessIsWrite, kIsAtomic))
++    if (LIKELY(old.IsBothReadsOrAtomic(kAccessIsWrite, kIsAtomic)))
+       break;
+     goto RACE;
+   }
+@@ -55,7 +59,7 @@ do {
+     StatInc(thr, StatShadowAnotherThread);
+     if (old.IsBothReadsOrAtomic(kAccessIsWrite, kIsAtomic))
+       break;
+-    if (HappensBefore(old, thr))
++    if (LIKELY(HappensBefore(old, thr)))
+       break;
+     goto RACE;
+   }
+
+commit 86a8d509653f1f9f9bedf278033d29deef19f436
+Author: Vitaly Buka <vitalybuka@google.com>
+Date:   Sat Feb 9 22:08:31 2019 +0000
+
+    tsan: Implement pthread_exit() interceptor for Thread sanitizer
+    
+    This change is preparation for fiber support.
+    
+    Author: yuri (Yuri Per)
+    Reviewed in: https://reviews.llvm.org/D57876
+    Context: https://reviews.llvm.org/D54889
+    
+    > llvm-svn: 353385
+    
+    llvm-svn: 353627
+
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_interceptors.cc b/compiler-rt/lib/tsan/rtl/tsan_interceptors.cc
+index 2a642a1e195..72ca5ae68b5 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_interceptors.cc
++++ b/compiler-rt/lib/tsan/rtl/tsan_interceptors.cc
+@@ -1050,6 +1050,13 @@ TSAN_INTERCEPTOR(int, pthread_detach, void *th) {
+   return res;
+ }
+ 
++TSAN_INTERCEPTOR(void, pthread_exit, void *retval) {
++  {
++    SCOPED_INTERCEPTOR_RAW(pthread_exit, retval);
++  }
++  REAL(pthread_exit)(retval);
++}
++
+ #if SANITIZER_LINUX
+ TSAN_INTERCEPTOR(int, pthread_tryjoin_np, void *th, void **ret) {
+   SCOPED_TSAN_INTERCEPTOR(pthread_tryjoin_np, th, ret);
+@@ -2664,6 +2671,7 @@ void InitializeInterceptors() {
+   TSAN_INTERCEPT(pthread_create);
+   TSAN_INTERCEPT(pthread_join);
+   TSAN_INTERCEPT(pthread_detach);
++  TSAN_INTERCEPT(pthread_exit);
+   #if SANITIZER_LINUX
+   TSAN_INTERCEPT(pthread_tryjoin_np);
+   TSAN_INTERCEPT(pthread_timedjoin_np);
+
+commit ca524b19c1524b7e43fee229d690384fd2bea27e
+Author: Dmitry Vyukov <dvyukov@google.com>
+Date:   Tue Feb 12 08:11:07 2019 +0000
+
+    tsan: Introduce in_symbolizer() function for Thread sanitizer
+    
+    This change is preparation for fiber support.
+    
+    Author: yuri (Yuri Per)
+    Reviewed in: https://reviews.llvm.org/D58104
+    
+    llvm-svn: 353805
+
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_interceptors.cc b/compiler-rt/lib/tsan/rtl/tsan_interceptors.cc
+index 72ca5ae68b5..b9f245e409b 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_interceptors.cc
++++ b/compiler-rt/lib/tsan/rtl/tsan_interceptors.cc
+@@ -398,7 +398,7 @@ static int setup_at_exit_wrapper(ThreadState *thr, uptr pc, void(*f)(),
+ 
+ #if !SANITIZER_ANDROID
+ TSAN_INTERCEPTOR(int, atexit, void (*f)()) {
+-  if (UNLIKELY(cur_thread()->in_symbolizer))
++  if (in_symbolizer())
+     return 0;
+   // We want to setup the atexit callback even if we are in ignored lib
+   // or after fork.
+@@ -408,7 +408,7 @@ TSAN_INTERCEPTOR(int, atexit, void (*f)()) {
+ #endif
+ 
+ TSAN_INTERCEPTOR(int, __cxa_atexit, void (*f)(void *a), void *arg, void *dso) {
+-  if (UNLIKELY(cur_thread()->in_symbolizer))
++  if (in_symbolizer())
+     return 0;
+   SCOPED_TSAN_INTERCEPTOR(__cxa_atexit, f, arg, dso);
+   return setup_at_exit_wrapper(thr, pc, (void(*)())f, arg, dso);
+@@ -454,7 +454,7 @@ static void on_exit_wrapper(int status, void *arg) {
+ }
+ 
+ TSAN_INTERCEPTOR(int, on_exit, void(*f)(int, void*), void *arg) {
+-  if (UNLIKELY(cur_thread()->in_symbolizer))
++  if (in_symbolizer())
+     return 0;
+   SCOPED_TSAN_INTERCEPTOR(on_exit, f, arg);
+   AtExitCtx *ctx = (AtExitCtx*)InternalAlloc(sizeof(AtExitCtx));
+@@ -664,7 +664,7 @@ TSAN_INTERCEPTOR(void, _longjmp, uptr *env, int val) {
+ 
+ #if !SANITIZER_MAC
+ TSAN_INTERCEPTOR(void*, malloc, uptr size) {
+-  if (UNLIKELY(cur_thread()->in_symbolizer))
++  if (in_symbolizer())
+     return InternalAlloc(size);
+   void *p = 0;
+   {
+@@ -681,7 +681,7 @@ TSAN_INTERCEPTOR(void*, __libc_memalign, uptr align, uptr sz) {
+ }
+ 
+ TSAN_INTERCEPTOR(void*, calloc, uptr size, uptr n) {
+-  if (UNLIKELY(cur_thread()->in_symbolizer))
++  if (in_symbolizer())
+     return InternalCalloc(size, n);
+   void *p = 0;
+   {
+@@ -693,7 +693,7 @@ TSAN_INTERCEPTOR(void*, calloc, uptr size, uptr n) {
+ }
+ 
+ TSAN_INTERCEPTOR(void*, realloc, void *p, uptr size) {
+-  if (UNLIKELY(cur_thread()->in_symbolizer))
++  if (in_symbolizer())
+     return InternalRealloc(p, size);
+   if (p)
+     invoke_free_hook(p);
+@@ -708,7 +708,7 @@ TSAN_INTERCEPTOR(void*, realloc, void *p, uptr size) {
+ TSAN_INTERCEPTOR(void, free, void *p) {
+   if (p == 0)
+     return;
+-  if (UNLIKELY(cur_thread()->in_symbolizer))
++  if (in_symbolizer())
+     return InternalFree(p);
+   invoke_free_hook(p);
+   SCOPED_INTERCEPTOR_RAW(free, p);
+@@ -718,7 +718,7 @@ TSAN_INTERCEPTOR(void, free, void *p) {
+ TSAN_INTERCEPTOR(void, cfree, void *p) {
+   if (p == 0)
+     return;
+-  if (UNLIKELY(cur_thread()->in_symbolizer))
++  if (in_symbolizer())
+     return InternalFree(p);
+   invoke_free_hook(p);
+   SCOPED_INTERCEPTOR_RAW(cfree, p);
+@@ -807,14 +807,14 @@ TSAN_INTERCEPTOR(void*, memalign, uptr align, uptr sz) {
+ 
+ #if !SANITIZER_MAC
+ TSAN_INTERCEPTOR(void*, aligned_alloc, uptr align, uptr sz) {
+-  if (UNLIKELY(cur_thread()->in_symbolizer))
++  if (in_symbolizer())
+     return InternalAlloc(sz, nullptr, align);
+   SCOPED_INTERCEPTOR_RAW(aligned_alloc, align, sz);
+   return user_aligned_alloc(thr, pc, align, sz);
+ }
+ 
+ TSAN_INTERCEPTOR(void*, valloc, uptr sz) {
+-  if (UNLIKELY(cur_thread()->in_symbolizer))
++  if (in_symbolizer())
+     return InternalAlloc(sz, nullptr, GetPageSizeCached());
+   SCOPED_INTERCEPTOR_RAW(valloc, sz);
+   return user_valloc(thr, pc, sz);
+@@ -823,7 +823,7 @@ TSAN_INTERCEPTOR(void*, valloc, uptr sz) {
+ 
+ #if SANITIZER_LINUX
+ TSAN_INTERCEPTOR(void*, pvalloc, uptr sz) {
+-  if (UNLIKELY(cur_thread()->in_symbolizer)) {
++  if (in_symbolizer()) {
+     uptr PageSize = GetPageSizeCached();
+     sz = sz ? RoundUpTo(sz, PageSize) : PageSize;
+     return InternalAlloc(sz, nullptr, PageSize);
+@@ -838,7 +838,7 @@ TSAN_INTERCEPTOR(void*, pvalloc, uptr sz) {
+ 
+ #if !SANITIZER_MAC
+ TSAN_INTERCEPTOR(int, posix_memalign, void **memptr, uptr align, uptr sz) {
+-  if (UNLIKELY(cur_thread()->in_symbolizer)) {
++  if (in_symbolizer()) {
+     void *p = InternalAlloc(sz, nullptr, align);
+     if (!p)
+       return errno_ENOMEM;
+@@ -2097,7 +2097,7 @@ TSAN_INTERCEPTOR(int, getaddrinfo, void *node, void *service,
+ }
+ 
+ TSAN_INTERCEPTOR(int, fork, int fake) {
+-  if (UNLIKELY(cur_thread()->in_symbolizer))
++  if (in_symbolizer())
+     return REAL(fork)(fake);
+   SCOPED_INTERCEPTOR_RAW(fork, fake);
+   ForkBefore(thr, pc);
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_interceptors.h b/compiler-rt/lib/tsan/rtl/tsan_interceptors.h
+index 763b46b88c8..29b0f76f971 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_interceptors.h
++++ b/compiler-rt/lib/tsan/rtl/tsan_interceptors.h
+@@ -21,6 +21,12 @@ class ScopedInterceptor {
+ 
+ LibIgnore *libignore();
+ 
++#if !SANITIZER_GO
++INLINE bool in_symbolizer() {
++  return UNLIKELY(cur_thread()->in_symbolizer);
++}
++#endif
++
+ }  // namespace __tsan
+ 
+ #define SCOPED_INTERCEPTOR_RAW(func, ...) \
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_malloc_mac.cc b/compiler-rt/lib/tsan/rtl/tsan_malloc_mac.cc
+index 9b32399fd13..0b874aecb99 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_malloc_mac.cc
++++ b/compiler-rt/lib/tsan/rtl/tsan_malloc_mac.cc
+@@ -28,19 +28,19 @@ using namespace __tsan;
+   void *p =                                     \
+       user_memalign(cur_thread(), StackTrace::GetCurrentPc(), alignment, size)
+ #define COMMON_MALLOC_MALLOC(size)                             \
+-  if (cur_thread()->in_symbolizer) return InternalAlloc(size); \
++  if (in_symbolizer()) return InternalAlloc(size);             \
+   SCOPED_INTERCEPTOR_RAW(malloc, size);                        \
+   void *p = user_alloc(thr, pc, size)
+ #define COMMON_MALLOC_REALLOC(ptr, size)                              \
+-  if (cur_thread()->in_symbolizer) return InternalRealloc(ptr, size); \
++  if (in_symbolizer()) return InternalRealloc(ptr, size);             \
+   SCOPED_INTERCEPTOR_RAW(realloc, ptr, size);                         \
+   void *p = user_realloc(thr, pc, ptr, size)
+ #define COMMON_MALLOC_CALLOC(count, size)                              \
+-  if (cur_thread()->in_symbolizer) return InternalCalloc(count, size); \
++  if (in_symbolizer()) return InternalCalloc(count, size);             \
+   SCOPED_INTERCEPTOR_RAW(calloc, size, count);                         \
+   void *p = user_calloc(thr, pc, size, count)
+ #define COMMON_MALLOC_POSIX_MEMALIGN(memptr, alignment, size)      \
+-  if (cur_thread()->in_symbolizer) {                               \
++  if (in_symbolizer()) {                                           \
+     void *p = InternalAlloc(size, nullptr, alignment);             \
+     if (!p) return errno_ENOMEM;                                   \
+     *memptr = p;                                                   \
+@@ -49,12 +49,12 @@ using namespace __tsan;
+   SCOPED_INTERCEPTOR_RAW(posix_memalign, memptr, alignment, size); \
+   int res = user_posix_memalign(thr, pc, memptr, alignment, size);
+ #define COMMON_MALLOC_VALLOC(size)                            \
+-  if (cur_thread()->in_symbolizer)                            \
++  if (in_symbolizer())                                        \
+     return InternalAlloc(size, nullptr, GetPageSizeCached()); \
+   SCOPED_INTERCEPTOR_RAW(valloc, size);                       \
+   void *p = user_valloc(thr, pc, size)
+ #define COMMON_MALLOC_FREE(ptr)                              \
+-  if (cur_thread()->in_symbolizer) return InternalFree(ptr); \
++  if (in_symbolizer()) return InternalFree(ptr);             \
+   SCOPED_INTERCEPTOR_RAW(free, ptr);                         \
+   user_free(thr, pc, ptr)
+ #define COMMON_MALLOC_SIZE(ptr) uptr size = user_alloc_usable_size(ptr);
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_new_delete.cc b/compiler-rt/lib/tsan/rtl/tsan_new_delete.cc
+index 4c2383fd459..4cbdf703ad2 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_new_delete.cc
++++ b/compiler-rt/lib/tsan/rtl/tsan_new_delete.cc
+@@ -29,7 +29,7 @@ DECLARE_REAL(void, free, void *ptr)
+ 
+ // TODO(alekseys): throw std::bad_alloc instead of dying on OOM.
+ #define OPERATOR_NEW_BODY(mangled_name, nothrow) \
+-  if (cur_thread()->in_symbolizer) \
++  if (in_symbolizer()) \
+     return InternalAlloc(size); \
+   void *p = 0; \
+   {  \
+@@ -44,7 +44,7 @@ DECLARE_REAL(void, free, void *ptr)
+   return p;
+ 
+ #define OPERATOR_NEW_BODY_ALIGN(mangled_name, nothrow) \
+-  if (cur_thread()->in_symbolizer) \
++  if (in_symbolizer()) \
+     return InternalAlloc(size, nullptr, (uptr)align); \
+   void *p = 0; \
+   {  \
+@@ -114,7 +114,7 @@ void *operator new[](__sanitizer::uptr size, std::align_val_t align,
+ 
+ #define OPERATOR_DELETE_BODY(mangled_name) \
+   if (ptr == 0) return;  \
+-  if (cur_thread()->in_symbolizer) \
++  if (in_symbolizer()) \
+     return InternalFree(ptr); \
+   invoke_free_hook(ptr);  \
+   SCOPED_INTERCEPTOR_RAW(mangled_name, ptr);  \
+
+commit 76e961207bd19b218f2afe66e55511261ee2f132
+Author: Dmitry Vyukov <dvyukov@google.com>
+Date:   Wed Feb 13 13:21:24 2019 +0000
+
+    tsan: add fiber support
+    
+    This patch adds functions for managing fibers:
+    
+    __tsan_get_current_fiber()
+    __tsan_create_fiber()
+    __tsan_destroy_fiber()
+    __tsan_switch_to_fiber()
+    __tsan_set_fiber_name()
+    
+    See the added tests for use examples.
+    
+    Author: yuri (Yuri Per)
+    Reviewed in: https://reviews.llvm.org/D54889
+    
+    [The previous commit of this change was reverted,
+    this is a resubmit with a squashed fix for check_analyze.sh
+    and COMMON_INTERCEPTOR_NOTHING_IS_INITIALIZED]
+    
+    llvm-svn: 353947
+
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_thread_registry.h b/compiler-rt/lib/sanitizer_common/sanitizer_thread_registry.h
+index fc38d0f80d2..493aa988f7e 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_thread_registry.h
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_thread_registry.h
+@@ -31,6 +31,7 @@ enum ThreadStatus {
+ enum class ThreadType {
+   Regular, // Normal thread
+   Worker,  // macOS Grand Central Dispatch (GCD) worker thread
++  Fiber,   // Fiber
+ };
+ 
+ // Generic thread context. Specific sanitizer tools may inherit from it.
+diff --git a/compiler-rt/lib/tsan/check_analyze.sh b/compiler-rt/lib/tsan/check_analyze.sh
+index 5e7a9a96742..a2a7e82b47a 100755
+--- a/compiler-rt/lib/tsan/check_analyze.sh
++++ b/compiler-rt/lib/tsan/check_analyze.sh
+@@ -35,18 +35,12 @@ check() {
+ }
+ 
+ for f in write1 write2 write4 write8; do
+-  check $f rsp 1
+-  check $f push 1
+-  check $f pop 8
+-done
+-
+-for f in read1; do
+   check $f rsp 1
+   check $f push 2
+   check $f pop 16
+ done
+ 
+-for f in read2 read4 read8; do
++for f in read1 read2 read4 read8; do
+   check $f rsp 1
+   check $f push 3
+   check $f pop 24
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_interceptors.cc b/compiler-rt/lib/tsan/rtl/tsan_interceptors.cc
+index b9f245e409b..e4b8def7831 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_interceptors.cc
++++ b/compiler-rt/lib/tsan/rtl/tsan_interceptors.cc
+@@ -153,7 +153,7 @@ const int SIG_SETMASK = 2;
+ #endif
+ 
+ #define COMMON_INTERCEPTOR_NOTHING_IS_INITIALIZED \
+-  (!cur_thread()->is_inited)
++  (cur_thread_init(), !cur_thread()->is_inited)
+ 
+ namespace __tsan {
+ struct SignalDesc {
+@@ -554,6 +554,7 @@ static void LongJmp(ThreadState *thr, uptr *env) {
+ 
+ // FIXME: put everything below into a common extern "C" block?
+ extern "C" void __tsan_setjmp(uptr sp, uptr mangled_sp) {
++  cur_thread_init();
+   SetJmp(cur_thread(), sp, mangled_sp);
+ }
+ 
+@@ -942,6 +943,7 @@ extern "C" void *__tsan_thread_start_func(void *arg) {
+   void *param = p->param;
+   int tid = 0;
+   {
++    cur_thread_init();
+     ThreadState *thr = cur_thread();
+     // Thread-local state is not initialized yet.
+     ScopedIgnoreInterceptors ignore;
+@@ -1053,6 +1055,9 @@ TSAN_INTERCEPTOR(int, pthread_detach, void *th) {
+ TSAN_INTERCEPTOR(void, pthread_exit, void *retval) {
+   {
+     SCOPED_INTERCEPTOR_RAW(pthread_exit, retval);
++#if !SANITIZER_MAC && !SANITIZER_ANDROID
++    CHECK_EQ(thr, &cur_thread_placeholder);
++#endif
+   }
+   REAL(pthread_exit)(retval);
+ }
+@@ -1981,6 +1986,7 @@ static bool is_sync_signal(ThreadSignalContext *sctx, int sig) {
+ void ALWAYS_INLINE rtl_generic_sighandler(bool sigact, int sig,
+                                           __sanitizer_siginfo *info,
+                                           void *ctx) {
++  cur_thread_init();
+   ThreadState *thr = cur_thread();
+   ThreadSignalContext *sctx = SigCtx(thr);
+   if (sig < 0 || sig >= kSigCount) {
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_interceptors.h b/compiler-rt/lib/tsan/rtl/tsan_interceptors.h
+index 29b0f76f971..88d1edd775d 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_interceptors.h
++++ b/compiler-rt/lib/tsan/rtl/tsan_interceptors.h
+@@ -23,6 +23,7 @@ LibIgnore *libignore();
+ 
+ #if !SANITIZER_GO
+ INLINE bool in_symbolizer() {
++  cur_thread_init();
+   return UNLIKELY(cur_thread()->in_symbolizer);
+ }
+ #endif
+@@ -30,6 +31,7 @@ INLINE bool in_symbolizer() {
+ }  // namespace __tsan
+ 
+ #define SCOPED_INTERCEPTOR_RAW(func, ...) \
++    cur_thread_init(); \
+     ThreadState *thr = cur_thread(); \
+     const uptr caller_pc = GET_CALLER_PC(); \
+     ScopedInterceptor si(thr, #func, caller_pc); \
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_interface.cc b/compiler-rt/lib/tsan/rtl/tsan_interface.cc
+index 09a84015295..8101ba19382 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_interface.cc
++++ b/compiler-rt/lib/tsan/rtl/tsan_interface.cc
+@@ -24,6 +24,7 @@ typedef u32 uint32_t;
+ typedef u64 uint64_t;
+ 
+ void __tsan_init() {
++  cur_thread_init();
+   Initialize(cur_thread());
+ }
+ 
+@@ -123,6 +124,33 @@ void __sanitizer_unaligned_store64(uu64 *addr, u64 v) {
+   __tsan_unaligned_write8(addr);
+   *addr = v;
+ }
++
++#if !SANITIZER_MAC && !SANITIZER_ANDROID
++SANITIZER_INTERFACE_ATTRIBUTE
++void *__tsan_get_current_fiber() {
++  return cur_thread();
++}
++
++SANITIZER_INTERFACE_ATTRIBUTE
++void *__tsan_create_fiber(unsigned flags) {
++  return FiberCreate(cur_thread(), CALLERPC, flags);
++}
++
++SANITIZER_INTERFACE_ATTRIBUTE
++void __tsan_destroy_fiber(void *fiber) {
++  FiberDestroy(cur_thread(), CALLERPC, static_cast<ThreadState *>(fiber));
++}
++
++SANITIZER_INTERFACE_ATTRIBUTE
++void __tsan_switch_to_fiber(void *fiber, unsigned flags) {
++  FiberSwitch(cur_thread(), CALLERPC, static_cast<ThreadState *>(fiber), flags);
++}
++
++SANITIZER_INTERFACE_ATTRIBUTE
++void __tsan_set_fiber_name(void *fiber, const char *name) {
++  ThreadSetName(static_cast<ThreadState *>(fiber), name);
++}
++#endif // !SANITIZER_MAC && !SANITIZER_ANDROID
+ }  // extern "C"
+ 
+ void __tsan_acquire(void *addr) {
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_rtl.h b/compiler-rt/lib/tsan/rtl/tsan_rtl.h
+index 37ca731e923..1804deaf56a 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_rtl.h
++++ b/compiler-rt/lib/tsan/rtl/tsan_rtl.h
+@@ -384,6 +384,9 @@ struct ThreadState {
+   // taken by epoch between synchs.
+   // This way we can save one load from tls.
+   u64 fast_synch_epoch;
++  // Technically `current` should be a separate THREADLOCAL variable;
++  // but it is placed here in order to share cache line with previous fields.
++  ThreadState* current;
+   // This is a slow path flag. On fast path, fast_state.GetIgnoreBit() is read.
+   // We do not distinguish beteween ignoring reads and writes
+   // for better performance.
+@@ -462,11 +465,20 @@ struct ThreadState {
+ #if SANITIZER_MAC || SANITIZER_ANDROID
+ ThreadState *cur_thread();
+ void cur_thread_finalize();
++INLINE void cur_thread_init() { }
+ #else
+ __attribute__((tls_model("initial-exec")))
+ extern THREADLOCAL char cur_thread_placeholder[];
+ INLINE ThreadState *cur_thread() {
+-  return reinterpret_cast<ThreadState *>(&cur_thread_placeholder);
++  return reinterpret_cast<ThreadState *>(cur_thread_placeholder)->current;
++}
++INLINE void cur_thread_init() {
++  ThreadState *thr = reinterpret_cast<ThreadState *>(cur_thread_placeholder);
++  if (UNLIKELY(!thr->current))
++    thr->current = thr;
++}
++INLINE void set_cur_thread(ThreadState *thr) {
++  reinterpret_cast<ThreadState *>(cur_thread_placeholder)->current = thr;
+ }
+ INLINE void cur_thread_finalize() { }
+ #endif  // SANITIZER_MAC || SANITIZER_ANDROID
+@@ -868,6 +880,16 @@ uptr ALWAYS_INLINE HeapEnd() {
+ }
+ #endif
+ 
++ThreadState *FiberCreate(ThreadState *thr, uptr pc, unsigned flags);
++void FiberDestroy(ThreadState *thr, uptr pc, ThreadState *fiber);
++void FiberSwitch(ThreadState *thr, uptr pc, ThreadState *fiber, unsigned flags);
++
++// These need to match __tsan_switch_to_fiber_* flags defined in
++// tsan_interface.h. See documentation there as well.
++enum FiberSwitchFlags {
++  FiberSwitchFlagNoSync = 1 << 0, // __tsan_switch_to_fiber_no_sync
++};
++
+ }  // namespace __tsan
+ 
+ #endif  // TSAN_RTL_H
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_rtl_thread.cc b/compiler-rt/lib/tsan/rtl/tsan_rtl_thread.cc
+index de429a553d1..60513489448 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_rtl_thread.cc
++++ b/compiler-rt/lib/tsan/rtl/tsan_rtl_thread.cc
+@@ -246,7 +246,8 @@ void ThreadStart(ThreadState *thr, int tid, tid_t os_id,
+   uptr tls_addr = 0;
+   uptr tls_size = 0;
+ #if !SANITIZER_GO
+-  GetThreadStackAndTls(tid == 0, &stk_addr, &stk_size, &tls_addr, &tls_size);
++  if (thread_type != ThreadType::Fiber)
++    GetThreadStackAndTls(tid == 0, &stk_addr, &stk_size, &tls_addr, &tls_size);
+ 
+   if (tid) {
+     if (stk_addr && stk_size)
+@@ -404,4 +405,40 @@ void MemoryAccessRange(ThreadState *thr, uptr pc, uptr addr,
+   }
+ }
+ 
++#if !SANITIZER_MAC && !SANITIZER_ANDROID && !SANITIZER_GO
++void FiberSwitchImpl(ThreadState *from, ThreadState *to) {
++  Processor *proc = from->proc();
++  ProcUnwire(proc, from);
++  ProcWire(proc, to);
++  set_cur_thread(to);
++}
++
++ThreadState *FiberCreate(ThreadState *thr, uptr pc, unsigned flags) {
++  void *mem = internal_alloc(MBlockThreadContex, sizeof(ThreadState));
++  ThreadState *fiber = static_cast<ThreadState *>(mem);
++  internal_memset(fiber, 0, sizeof(*fiber));
++  int tid = ThreadCreate(thr, pc, 0, true);
++  FiberSwitchImpl(thr, fiber);
++  ThreadStart(fiber, tid, 0, ThreadType::Fiber);
++  FiberSwitchImpl(fiber, thr);
++  return fiber;
++}
++
++void FiberDestroy(ThreadState *thr, uptr pc, ThreadState *fiber) {
++  FiberSwitchImpl(thr, fiber);
++  ThreadFinish(fiber);
++  FiberSwitchImpl(fiber, thr);
++  internal_free(fiber);
++}
++
++void FiberSwitch(ThreadState *thr, uptr pc,
++                 ThreadState *fiber, unsigned flags) {
++  if (!(flags & FiberSwitchFlagNoSync))
++    Release(thr, pc, (uptr)fiber);
++  FiberSwitchImpl(thr, fiber);
++  if (!(flags & FiberSwitchFlagNoSync))
++    Acquire(fiber, pc, (uptr)fiber);
++}
++#endif
++
+ }  // namespace __tsan
+
+commit 4d2b9426b99f1d6d4d4b168a3133124ea85da7ea
+Author: Julian Lettner <jlettner@apple.com>
+Date:   Sat Apr 20 00:18:44 2019 +0000
+
+    [TSan] Support fiber API on macOS
+    
+    Committing on behalf of Yuri Per (yuri).
+    
+    Reviewers: dvyukov, kubamracek, yln
+    
+    Reviewed By: kubamracek
+    
+    Authored By: yuri
+    
+    Differential Revision: https://reviews.llvm.org/D58110
+    
+    llvm-svn: 358802
+
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_interceptors_mac.cc b/compiler-rt/lib/tsan/rtl/tsan_interceptors_mac.cc
+index 12a0c4729c3..99c6df9dfde 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_interceptors_mac.cc
++++ b/compiler-rt/lib/tsan/rtl/tsan_interceptors_mac.cc
+@@ -20,8 +20,10 @@
+ #include "tsan_interface_ann.h"
+ #include "sanitizer_common/sanitizer_addrhashmap.h"
+ 
++#include <errno.h>
+ #include <libkern/OSAtomic.h>
+ #include <objc/objc-sync.h>
++#include <sys/ucontext.h>
+ 
+ #if defined(__has_include) && __has_include(<xpc/xpc.h>)
+ #include <xpc/xpc.h>
+@@ -29,6 +31,11 @@
+ 
+ typedef long long_t;  // NOLINT
+ 
++extern "C" {
++int getcontext(ucontext_t *ucp) __attribute__((returns_twice));
++int setcontext(const ucontext_t *ucp);
++}
++
+ namespace __tsan {
+ 
+ // The non-barrier versions of OSAtomic* functions are semantically mo_relaxed,
+@@ -353,6 +360,31 @@ TSAN_INTERCEPTOR(int, objc_sync_exit, id obj) {
+   return result;
+ }
+ 
++TSAN_INTERCEPTOR(int, swapcontext, ucontext_t *oucp, const ucontext_t *ucp) {
++  {
++    SCOPED_INTERCEPTOR_RAW(swapcontext, oucp, ucp);
++  }
++  // Bacause of swapcontext() semantics we have no option but to copy its
++  // impementation here
++  if (!oucp || !ucp) {
++    errno = EINVAL;
++    return -1;
++  }
++  ThreadState *thr = cur_thread();
++  const int UCF_SWAPPED = 0x80000000;
++  oucp->uc_onstack &= ~UCF_SWAPPED;
++  thr->ignore_interceptors++;
++  int ret = getcontext(oucp);
++  if (!(oucp->uc_onstack & UCF_SWAPPED)) {
++    thr->ignore_interceptors--;
++    if (!ret) {
++      oucp->uc_onstack |= UCF_SWAPPED;
++      ret = setcontext(ucp);
++    }
++  }
++  return ret;
++}
++
+ // On macOS, libc++ is always linked dynamically, so intercepting works the
+ // usual way.
+ #define STDCXX_INTERCEPTOR TSAN_INTERCEPTOR
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_interface.cc b/compiler-rt/lib/tsan/rtl/tsan_interface.cc
+index 8101ba19382..508aadb08f6 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_interface.cc
++++ b/compiler-rt/lib/tsan/rtl/tsan_interface.cc
+@@ -125,7 +125,6 @@ void __sanitizer_unaligned_store64(uu64 *addr, u64 v) {
+   *addr = v;
+ }
+ 
+-#if !SANITIZER_MAC && !SANITIZER_ANDROID
+ SANITIZER_INTERFACE_ATTRIBUTE
+ void *__tsan_get_current_fiber() {
+   return cur_thread();
+@@ -150,7 +149,6 @@ SANITIZER_INTERFACE_ATTRIBUTE
+ void __tsan_set_fiber_name(void *fiber, const char *name) {
+   ThreadSetName(static_cast<ThreadState *>(fiber), name);
+ }
+-#endif // !SANITIZER_MAC && !SANITIZER_ANDROID
+ }  // extern "C"
+ 
+ void __tsan_acquire(void *addr) {
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_platform_linux.cc b/compiler-rt/lib/tsan/rtl/tsan_platform_linux.cc
+index d6a477db8d9..d6a05386fe0 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_platform_linux.cc
++++ b/compiler-rt/lib/tsan/rtl/tsan_platform_linux.cc
+@@ -401,6 +401,10 @@ ThreadState *cur_thread() {
+   return thr;
+ }
+ 
++void set_cur_thread(ThreadState *thr) {
++  *get_android_tls_ptr() = reinterpret_cast<uptr>(thr);
++}
++
+ void cur_thread_finalize() {
+   __sanitizer_sigset_t emptyset;
+   internal_sigfillset(&emptyset);
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_platform_mac.cc b/compiler-rt/lib/tsan/rtl/tsan_platform_mac.cc
+index b832d22d1a3..9b9c8dbe186 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_platform_mac.cc
++++ b/compiler-rt/lib/tsan/rtl/tsan_platform_mac.cc
+@@ -73,22 +73,22 @@ static void *SignalSafeGetOrAllocate(uptr *dst, uptr size) {
+ // shadow memory is set up.
+ static uptr main_thread_identity = 0;
+ ALIGNED(64) static char main_thread_state[sizeof(ThreadState)];
++static ThreadState *main_thread_state_loc = (ThreadState *)main_thread_state;
+ 
+-ThreadState **cur_thread_location() {
+-  ThreadState **thread_identity = (ThreadState **)pthread_self();
+-  return ((uptr)thread_identity == main_thread_identity) ? nullptr
+-                                                         : thread_identity;
++static ThreadState **cur_thread_location() {
++  uptr thread_identity = (uptr)pthread_self();
++  if (thread_identity == main_thread_identity || main_thread_identity == 0)
++    return &main_thread_state_loc;
++  return (ThreadState **)MemToShadow(thread_identity);
+ }
+ 
+ ThreadState *cur_thread() {
+-  ThreadState **thr_state_loc = cur_thread_location();
+-  if (thr_state_loc == nullptr || main_thread_identity == 0) {
+-    return (ThreadState *)&main_thread_state;
+-  }
+-  ThreadState **fake_tls = (ThreadState **)MemToShadow((uptr)thr_state_loc);
+-  ThreadState *thr = (ThreadState *)SignalSafeGetOrAllocate(
+-      (uptr *)fake_tls, sizeof(ThreadState));
+-  return thr;
++  return (ThreadState *)SignalSafeGetOrAllocate(
++      (uptr *)cur_thread_location(), sizeof(ThreadState));
++}
++
++void set_cur_thread(ThreadState *thr) {
++  *cur_thread_location() = thr;
+ }
+ 
+ // TODO(kuba.brecka): This is not async-signal-safe. In particular, we call
+@@ -96,14 +96,13 @@ ThreadState *cur_thread() {
+ // handler will try to access the unmapped ThreadState.
+ void cur_thread_finalize() {
+   ThreadState **thr_state_loc = cur_thread_location();
+-  if (thr_state_loc == nullptr) {
++  if (thr_state_loc == &main_thread_state_loc) {
+     // Calling dispatch_main() or xpc_main() actually invokes pthread_exit to
+     // exit the main thread. Let's keep the main thread's ThreadState.
+     return;
+   }
+-  ThreadState **fake_tls = (ThreadState **)MemToShadow((uptr)thr_state_loc);
+-  internal_munmap(*fake_tls, sizeof(ThreadState));
+-  *fake_tls = nullptr;
++  internal_munmap(*thr_state_loc, sizeof(ThreadState));
++  *thr_state_loc = nullptr;
+ }
+ #endif
+ 
+@@ -265,11 +264,11 @@ void ImitateTlsWrite(ThreadState *thr, uptr tls_addr, uptr tls_size) {
+   // The pointer to the ThreadState object is stored in the shadow memory
+   // of the tls.
+   uptr tls_end = tls_addr + tls_size;
+-  ThreadState **thr_state_loc = cur_thread_location();
+-  if (thr_state_loc == nullptr) {
++  uptr thread_identity = (uptr)pthread_self();
++  if (thread_identity == main_thread_identity) {
+     MemoryRangeImitateWrite(thr, /*pc=*/2, tls_addr, tls_size);
+   } else {
+-    uptr thr_state_start = (uptr)thr_state_loc;
++    uptr thr_state_start = thread_identity;
+     uptr thr_state_end = thr_state_start + sizeof(uptr);
+     CHECK_GE(thr_state_start, tls_addr);
+     CHECK_LE(thr_state_start, tls_addr + tls_size);
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_rtl.h b/compiler-rt/lib/tsan/rtl/tsan_rtl.h
+index 1804deaf56a..c618e50ae6f 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_rtl.h
++++ b/compiler-rt/lib/tsan/rtl/tsan_rtl.h
+@@ -464,6 +464,7 @@ struct ThreadState {
+ #if !SANITIZER_GO
+ #if SANITIZER_MAC || SANITIZER_ANDROID
+ ThreadState *cur_thread();
++void set_cur_thread(ThreadState *thr);
+ void cur_thread_finalize();
+ INLINE void cur_thread_init() { }
+ #else
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_rtl_thread.cc b/compiler-rt/lib/tsan/rtl/tsan_rtl_thread.cc
+index 60513489448..fd95cfed4f5 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_rtl_thread.cc
++++ b/compiler-rt/lib/tsan/rtl/tsan_rtl_thread.cc
+@@ -405,7 +405,7 @@ void MemoryAccessRange(ThreadState *thr, uptr pc, uptr addr,
+   }
+ }
+ 
+-#if !SANITIZER_MAC && !SANITIZER_ANDROID && !SANITIZER_GO
++#if !SANITIZER_GO
+ void FiberSwitchImpl(ThreadState *from, ThreadState *to) {
+   Processor *proc = from->proc();
+   ProcUnwire(proc, from);

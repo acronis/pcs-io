@@ -251,10 +251,12 @@ static void rio_abort(struct pcs_rdmaio *rio, int error)
 		struct rio_tx *tx = cd_list_first_entry(&rio->active_txs, struct rio_tx, list);
 		cd_list_del(&tx->list);
 
-		BUG_ON(!tx->msg);
-		pcs_set_local_error(&tx->msg->error, error);
-		rio_msg_sent(rio, NULL, tx->msg, 1);
-		rio_put_tx(rio->dev, tx);
+		if (tx->tx_state == TX_WAIT_FOR_READ_ACK) {
+			BUG_ON(!tx->msg);
+			pcs_set_local_error(&tx->msg->error, error);
+			rio_msg_sent(rio, NULL, tx->msg, 1);
+			rio_put_tx(rio->dev, tx);
+		}
 	}
 
 	pcs_ioconn_unregister(&rio->compc);

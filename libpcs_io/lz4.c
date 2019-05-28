@@ -1,8 +1,4 @@
 /*
- * Copyright © 2003-2018 Acronis International GmbH.
- */
-
-/*
    LZ4 - Fast LZ compression algorithm
    Copyright (C) 2011-2015, Yann Collet.
 

@@ -19,6 +19,10 @@
 #include "pcs_malloc.h"
 #include "log.h"
 
+#ifndef SOCK_CLOEXEC
+#define SOCK_CLOEXEC	0
+#endif
+
 #define socklisten_from_ioconn(conn) container_of(conn, struct pcs_socklisten, netlisten.ioconn)
 
 static struct pcs_netlisten_tops netlisten_tops;
@@ -30,7 +34,11 @@ static void data_ready(struct pcs_ioconn * conn)
 	for (;;) {
 		pcs_sock_t fd;
 
+#ifdef HAVE_ACCEPT4
+		fd = accept4(conn->fd, NULL, NULL, SOCK_CLOEXEC);
+#else
 		fd = accept(conn->fd, NULL, NULL);
+#endif
 		if (pcs_sock_invalid(fd)) {
 			int sock_err = errno;
 			int gc_progress = pcs_fd_gc_on_error(conn->proc, sock_err, PCS_GC_FD_ON_ACCEPT);
@@ -92,7 +100,7 @@ static void sl_accepted(struct pcs_socklisten *sl, pcs_sock_t fd)
 		pcs_sock_close(fd);
 		return;
 	}
-	
+
 	sio = pcs_sockio_fdinit(proc, fd, nl->alloc_size, nl->hdr_size);
 	if (!sio) {
 		pcs_sock_close(fd);
@@ -134,7 +142,7 @@ int pcs_socklisten_start(struct pcs_process * proc, struct pcs_socklisten * sh, 
 	pcs_sock_t fd;
 	struct pcs_ioconn *conn = &sh->netlisten.ioconn;
 
-	fd = socket(sh->sa->sa_family, SOCK_STREAM, 0);
+	fd = socket(sh->sa->sa_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	if (pcs_sock_invalid(fd))
 		return -pcs_sock_errno();
 

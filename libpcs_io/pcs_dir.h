@@ -8,6 +8,12 @@
 #include "pcs_types.h"
 #include "timer.h"
 
+#ifdef _WINDOWS_
+#define PCS_PATH_SEP '\\'
+#else
+#define PCS_PATH_SEP '/'
+#endif
+
 struct pcs_stat {
 	u32 mode;
 	u32 nlink;
@@ -39,6 +45,7 @@ typedef struct pcs_dirent {
  * Returns 1 if entry is found, 0 if there is no more entries and sets *out_dir pointer on success.
  * On error negative code is returned and *out_dir is left unchanged. */
 PCS_API __must_check int pcs_dirent_first(const char *path, u32 flags, pcs_dirent_t **out_dir);
+PCS_API __must_check int pcs_dirent_firstat(pcs_fd_t dirfd, const char *pathname, u32 flags, pcs_dirent_t **out_dir);
 PCS_API __must_check int pcs_dirent_next(pcs_dirent_t *dir);
 
 /* Close dir entry and free resources */
@@ -46,6 +53,7 @@ PCS_API void pcs_dirent_close(pcs_dirent_t *dir);
 
 /* Coroutine-based versions. Look above for explanation. */
 PCS_API __must_check int pcs_co_dirent_first(const char *path, u32 flags, pcs_dirent_t **out_dir);
+PCS_API __must_check int pcs_co_dirent_firstat(pcs_fd_t dirfd, const char *pathname, u32 flags, pcs_dirent_t **out_dir);
 PCS_API __must_check int pcs_co_dirent_next(pcs_dirent_t *dir);
 PCS_API void pcs_co_dirent_close(pcs_dirent_t *dir);
 

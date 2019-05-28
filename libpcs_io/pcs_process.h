@@ -27,6 +27,7 @@ struct pcs_job
 
 struct pcs_coroutine;
 struct pcs_co_event;
+struct pcs_co_rwlock;
 
 struct pcs_co_list
 {
@@ -74,12 +75,23 @@ struct pcs_process
 	struct pcs_co_list	co_list;
 	struct pcs_co_list	co_pool;
 	pcs_atomic_ptr_t	co_file_pool;
+	struct pcs_co_rwlock	*exec_lock;
+
+	pthread_mutex_t		co_runqueue_mutex;	/* protects co_runqueue */
+	struct cd_list		co_runqueue;		/* global runqueue */
+	pcs_atomic32_t		co_runqueue_nr;		/* size of global runqueue */
+
+	pcs_atomic32_t		co_ready_count;		/* total number of ready coroutines in all runqueues
+							   and coroutines being executed now */
+	pcs_atomic32_t		polling_evloops_count;	/* number of eventloops that do polling */
+
+	pcs_atomic32_t		evloop_wakeup_event_sent; /* evloop_wakeup_event is signaled nut not processed yet */
+	struct pcs_event_ioconn	*evloop_wakeup_event;	/* event to wakeup eventloop that do polling */
 
 	struct pcs_file_job_conn * co_io;
 	struct pcs_file_job_conn * co_cpu;
 	struct pcs_file_job_conn * co_ssl;
 
-	struct pcs_job	co_term_job;
 	struct cd_list	term_jobs;
 
 	/* FD GC */
@@ -90,6 +102,13 @@ struct pcs_process
 };
 
 #define PCS_MAX_EVENTS_NR	128
+#define PCS_EVLOOP_RUNQUEUE_SIZE	256	/* must be power of 2 */
+
+struct pcs_evloop_runqueue {
+	pcs_atomic32_t		head;
+	pcs_atomic32_t		tail;
+	struct pcs_coroutine	*buf[PCS_EVLOOP_RUNQUEUE_SIZE];
+};
 
 struct pcs_evloop {
 	pcs_thread_t	thr;
@@ -116,14 +135,17 @@ struct pcs_evloop {
 
 	abs_time_t	last_abs_time_us;
 	abs_time_t	last_abs_time_ms;
+	abs_time_t	last_poll_time_us;
+
+	u32		poll_count;
 
 	/* coroutines */
 	struct pcs_coroutine *co_idle;
 	struct pcs_coroutine *co_current;
+	struct pcs_coroutine *co_next;
 
-	struct pcs_co_list	co_runqueue[2];
-	unsigned int	co_runqueue_cur;
-	unsigned int	co_sched_seq;
+	struct pcs_evloop_runqueue	co_runqueue;
+	u32			steal_target;
 
 	u64		co_ctx_switches;
 
@@ -174,6 +196,9 @@ PCS_API void pcs_call_in_job2(struct pcs_process* proc, void (*fn)(void*, void*)
 
 int pcs_process_oom_adjust(void);
 
+int pcs_process_need_poll(struct pcs_evloop *evloop);
+void pcs_process_ping_watchdog(struct pcs_evloop *evloop);
+
 static inline int pcs_in_evloop(void)
 {
 	return likely(pcs_current_evloop != NULL);
@@ -199,6 +224,13 @@ static inline abs_time_t get_abs_time_fast_us(void)
 {
 	struct __pcs_current * curr = pcs_current;
 	return curr->evloop ? curr->evloop->last_abs_time_us : get_abs_time_us();
+}
+
+static inline u32 runqueue_size(struct pcs_evloop_runqueue *runqueue)
+{
+	u32 head = pcs_atomic32_load(&runqueue->head);
+	u32 tail = pcs_atomic32_load(&runqueue->tail);
+	return tail - head;
 }
 
 #endif /* _PCS_PROCESS_H_ */

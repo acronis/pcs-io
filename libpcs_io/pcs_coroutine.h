@@ -11,7 +11,7 @@
 #include "pcs_ucontext.h"
 #include "std_list.h"
 
-#if defined(__clang__) || defined(PCS_ADDR_SANIT)
+#if defined(__clang__) || defined(__aarch64__) || defined(PCS_ADDR_SANIT)
 /* clang too aggresivly inlines function which leads to waste of stack space */
 #define PCS_CO_STACK_SIZE	(64*1024)
 #else
@@ -69,7 +69,7 @@ struct pcs_coroutine
 
 	struct pcs_cancelable	io_wait;
 
-	unsigned int		sched_seq;
+	u32			poll_count;
 	u64			co_ctx_switches;
 
 	int			(*func)(struct pcs_coroutine *, void * arg);
@@ -85,8 +85,8 @@ struct pcs_coroutine
 			size_t		stack_size;
 		} asan;
 		struct {
-			void		*state;
-			int		keep_state;
+			void		*fiber;
+			int		keep_fiber;
 		} tsan;
 		struct {
 			unsigned int	stack_id;
@@ -155,12 +155,17 @@ PCS_API struct pcs_coroutine * pcs_move_to_coroutine(struct pcs_process * proc);
 PCS_API void pcs_move_from_coroutine(void);
 
 /* INTERNAL linkage to pcs_process.c, pcs_co_locks.c */
-void pcs_co_init_proc(struct pcs_process * proc);
+int pcs_co_init_proc(struct pcs_process * proc);
 void pcs_co_init_evloop(struct pcs_evloop * evloop);
 void pcs_co_fini_proc(struct pcs_process * proc);
+void pcs_co_enter_evloop(struct pcs_evloop * evloop);
+void pcs_co_exit_evloop(struct pcs_evloop * evloop);
 void pcs_co_fini_evloop(struct pcs_evloop * evloop);
+void pcs_co_filejob_init(struct pcs_process * proc);
+void pcs_co_filejob_fini(struct pcs_process * proc);
 void pcs_co_run(struct pcs_evloop * evloop);
 int pcs_co_find_runnable(struct pcs_evloop *evloop);
 void pcs_co_wakeup_waiting(struct pcs_coroutine *co);
+void pcs_co_steal(struct pcs_evloop *evloop);
 
 #endif /* _PCS_CO_H_ */

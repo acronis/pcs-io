@@ -27,6 +27,8 @@ static inline void *register_get_pc(ucontext_t *context)
 	return (void *)context->uc_mcontext.gregs[REG_EIP];
 #elif defined(__MAC__) && defined(__x86_64__)
 	return (void *)context->uc_mcontext->__ss.__rip;
+#elif defined(__aarch64__)
+	return (void *)context->uc_mcontext.pc;
 #else
 	return NULL;
 #endif
@@ -40,11 +42,15 @@ static inline void register_set_bp(ucontext_t *context, ULONG_PTR bp)
 	context->uc_mcontext.gregs[REG_EBP] = bp;
 #elif defined(__MAC__) && defined(__x86_64__)
 	context->uc_mcontext->__ss.__rbp = bp;
+#elif defined(__aarch64__)
+	/* X29 - frame pointer */
+	context->uc_mcontext.regs[29] = bp;
 #endif
 }
 
-void register_dump(ucontext_t *ctx, void (*log_printf)(const char *fmt, ...));
-void trace_dump(ucontext_t *ctx, void (*log_printf)(const char *fmt, ...));
-void trace_dump_coroutine(struct pcs_ucontext *ctx, void (*log_printf)(const char *fmt, ...));
+typedef void (*log_printf_fn)(void *arg, const char *fmt, ...) __printf(2, 3);
+void register_dump(ucontext_t *ctx, log_printf_fn log_printf, void *arg);
+void trace_dump(ucontext_t *ctx, log_printf_fn log_printf, void *arg);
+void trace_dump_coroutine(struct pcs_ucontext *ctx, log_printf_fn log_printf, void *arg);
 
 #endif /* _REGISTER_DUMP */

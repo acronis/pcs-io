@@ -96,9 +96,17 @@ void pcs_poll_process_events(struct pcs_evloop *evloop)
 
 int pcs_poll_init(struct pcs_process *proc)
 {
+#ifdef EPOLL_CLOEXEC
+	proc->epollfd = epoll_create1(EPOLL_CLOEXEC);
+	if (proc->epollfd < 0)
+		return -errno;
+#else
 	proc->epollfd = epoll_create(1);	/* size is ignored */
 	if (proc->epollfd < 0)
 		return -errno;
+
+	fcntl(proc->epollfd, F_SETFD, FD_CLOEXEC);
+#endif
 	return 0;
 }
 

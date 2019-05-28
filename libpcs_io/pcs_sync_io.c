@@ -46,6 +46,37 @@
 #				define SYS_openat 257 /* x86_64 */
 #			endif /* i386 */
 #		endif
+#		ifndef SYS_mkdirat
+#			ifdef __i386__
+#				define SYS_mkdirat 296 /* i386 */
+#			elif defined(__x86_64__)
+#				define SYS_mkdirat 258 /* x86_64 */
+#			endif /* i386 */
+#		endif
+#		ifndef SYS_fstatat
+#			ifdef __i386__
+#				define SYS_fstatat 300 /* i386 */
+#			elif defined(__x86_64__)
+#				define SYS_fstatat 262 /* x86_64 */
+#			endif /* i386 */
+#		endif
+#		ifndef SYS_unlinkat
+#			ifdef __i386__
+#				define SYS_unlinkat 301 /* i386 */
+#			elif defined(__x86_64__)
+#				define SYS_unlinkat 263 /* x86_64 */
+#			endif /* i386 */
+#		endif
+#		ifndef AT_REMOVEDIR
+#			define AT_REMOVEDIR 0x200
+#		endif
+#		ifndef SYS_renameat
+#			ifdef __i386__
+#				define SYS_renameat 302 /* i386 */
+#			elif defined(__x86_64__)
+#				define SYS_renameat 264 /* x86_64 */
+#			endif /* i386 */
+#		endif
 #		ifndef SYS_fallocate
 #			ifdef __i386__
 #				define SYS_fallocate 324 /* i386 */
@@ -136,9 +167,33 @@ int pcs_sync_nread(pcs_fd_t fd, u64 offs, void *buf, int sz)
 
 #ifdef __linux__
 #if !__GLIBC_PREREQ(2, 4)
+#ifndef AT_SYMLINK_NOFOLLOW
+#define AT_SYMLINK_NOFOLLOW 0x100
+#endif
+
 static int openat(int dirfd, const char *pathname, int flags, mode_t mode)
 {
 	return syscall(SYS_openat, dirfd, pathname, flags, mode);
+}
+
+static int mkdirat(int dirfd, const char *pathname, mode_t mode)
+{
+	return syscall(SYS_mkdirat, dirfd, pathname, mode);
+}
+
+static int fstatat(int dirfd, const char *pathname, struct stat *buf, int flags)
+{
+	return syscall(SYS_fstatat, dirfd, pathname, buf, flags);
+}
+
+static int unlinkat(int dirfd, const char *pathname, int flags)
+{
+	return syscall(SYS_unlinkat, dirfd, pathname, flags);
+}
+
+static int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath)
+{
+	return syscall(SYS_renameat, olddirfd, oldpath, newdirfd, newpath);
 }
 #endif /* !__GLIBC_PREREQ(2, 4) */
 #if !__GLIBC_PREREQ(2, 10)
@@ -262,7 +317,14 @@ int pcs_sync_fsync(pcs_fd_t fd)
 {
 	pcs_might_block();
 	for (;;) {
+#ifdef __MAC__
+		int r = fcntl(fd, F_FULLFSYNC);
+		// F_FULLFSYNC is not supported on SMB (checked with 10.12 and 10.14)
+		if (r < 0 && errno == ENOTSUP)
+			r = fsync(fd);
+#else
 		int r = fsync(fd);
+#endif
 		if (r < 0) {
 			if (errno == EINTR)
 				continue;
@@ -274,14 +336,12 @@ int pcs_sync_fsync(pcs_fd_t fd)
 
 int pcs_sync_fdatasync(pcs_fd_t fd)
 {
+#ifdef __MAC__
+	return pcs_sync_fsync(fd);
+#else
 	pcs_might_block();
 	for (;;) {
-		int r =
-#ifdef __linux__
-			fdatasync(fd);
-#else
-			fsync(fd);
-#endif
+		int r = fdatasync(fd);
 		if (r < 0) {
 			if (errno == EINTR)
 				continue;
@@ -289,6 +349,7 @@ int pcs_sync_fdatasync(pcs_fd_t fd)
 		}
 		return 0;
 	}
+#endif
 }
 
 /* returns 0 if ok or -errno if error */
@@ -348,7 +409,7 @@ int pcs_sync_open(const char * pathname, int flags, int mode, pcs_fd_t * out_fd)
 	pcs_might_block();
 	pcs_fd_t fd = -1;
 	while (1) {
-		fd = open(pathname, flags, mode);
+		fd = open(pathname, flags | O_CLOEXEC, mode);
 		if (fd >= 0)
 			break;
 		if (errno != EINTR)
@@ -358,31 +419,60 @@ int pcs_sync_open(const char * pathname, int flags, int mode, pcs_fd_t * out_fd)
 	return 0;
 }
 
-int pcs_sync_openat(pcs_fd_t dirfd, const char * pathname, int flags, int mode, pcs_fd_t * out_fd)
+#if defined(__LINUX__) && !__GLIBC_PREREQ(2, 4)
+#define USE_OPENAT_EMULATION
+char *pcs_pathat(pcs_fd_t dirfd, const char *pathname)
 {
+	BUG_ON(dirfd < 0); /* Do not allow special values PCS_INVALID_FD or AT_FDCWD */
+	BUG_ON(pathname[0] == '/');
+	return pcs_xasprintf("/proc/self/fd/%d/%s", dirfd, pathname);
+}
+#endif /* defined(__LINUX__) && !__GLIBC_PREREQ(2, 4) */
+
+/* We use openat() for security reasons to prevent a user to open a file or directory outside the parent directory.
+ * Thus we require @dirfd to be a valid directory descriptor, not special values like AT_FDCWD.
+ * We disallow multicomponent path as filename to prevent symlink attack, also we disable ".." to disallow jumping out from the parent directory. */
+int pcs_sync_openat(pcs_fd_t dirfd, const char *filename, int flags, int mode, pcs_fd_t * out_fd)
+{
+	BUG_ON(dirfd < 0); /* Do not allow special values PCS_INVALID_FD or AT_FDCWD, use pcs_sync_open() instead */
+	BUG_ON(!strcmp(filename, "..")); /* Disallow "..", but allow "." */
+
+	flags |= O_NOFOLLOW; /* If we use openat() we don't want follow symlinks */
+
 	pcs_might_block();
 	pcs_fd_t fd = -1;
 	while (1) {
-		fd = openat(dirfd, pathname, flags, mode);
+		fd = openat(dirfd, filename, flags | O_CLOEXEC, mode);
 		if (fd >= 0)
 			break;
 		if (errno != EINTR)
 			return -errno;
 	}
-	*out_fd = fd;
-	return 0;
+	if (fd >= 0) {
+		*out_fd = fd;
+		return 0;
+	}
+
+	int rc = -errno;
+#ifdef USE_OPENAT_EMULATION
+	if (rc != -ENOSYS)
+		return rc;
+
+	char *path = pcs_pathat(dirfd, filename);
+	rc = pcs_sync_open(path, flags, mode, out_fd);
+	pcs_free(path);
+#endif /* USE_OPENAT_EMULATION */
+	return rc;
 }
 
 int pcs_sync_close(pcs_fd_t fd)
 {
 	pcs_might_block();
-	while (1) {
-		int err = close(fd);
-		if (!err)
-			return 0;
-		if (errno != EINTR)
-			return -errno;
-	}
+	if (!close(fd))
+		return 0;
+	/* Close never should be retried, even on EINTR.
+	 * See http://man7.org/linux/man-pages/man2/close.2.html#NOTES */
+	return errno == EINTR ? 0 : -errno;
 }
 
 int pcs_sync_mkdir(const char *pathname, int mode)
@@ -391,10 +481,42 @@ int pcs_sync_mkdir(const char *pathname, int mode)
 	return mkdir(pathname, mode) == 0 ? 0 : -errno;
 }
 
+int pcs_sync_mkdirat(pcs_fd_t dirfd, const char *filename, int mode)
+{
+	BUG_ON(dirfd < 0); /* Do not allow special values PCS_INVALID_FD or AT_FDCWD, use pcs_sync_mkdir() instead */
+
+	pcs_might_block();
+	int rc = mkdirat(dirfd, filename, mode) == 0 ? 0 : -errno;
+#ifdef USE_OPENAT_EMULATION
+	if (rc != -ENOSYS)
+		return rc;
+	char *path = pcs_pathat(dirfd, filename);
+	rc = pcs_sync_mkdir(path, mode);
+	pcs_free(path);
+#endif /* USE_OPENAT_EMULATION */
+	return rc;
+}
+
 int pcs_sync_rmdir(const char *pathname)
 {
 	pcs_might_block();
 	return rmdir(pathname) == 0 ? 0 : -errno;
+}
+
+int pcs_sync_rmdirat(pcs_fd_t dirfd, const char *filename)
+{
+	BUG_ON(dirfd < 0); /* Do not allow special values PCS_INVALID_FD or AT_FDCWD, use pcs_sync_rmdir() instead */
+
+	pcs_might_block();
+	int rc = unlinkat(dirfd, filename, AT_REMOVEDIR) == 0 ? 0 : -errno;
+#ifdef USE_OPENAT_EMULATION
+	if (rc != -ENOSYS)
+		return rc;
+	char *path = pcs_pathat(dirfd, filename);
+	rc = pcs_sync_rmdir(path);
+	pcs_free(path);
+#endif /* USE_OPENAT_EMULATION */
+	return rc;
 }
 
 int pcs_sync_unlink(const char * pathname)
@@ -402,10 +524,46 @@ int pcs_sync_unlink(const char * pathname)
 	pcs_might_block();
 	return unlink(pathname) == 0 ? 0 : -errno;
 }
+
+int pcs_sync_unlinkat(pcs_fd_t dirfd, const char * filename, int flags)
+{
+	BUG_ON(dirfd < 0); /* Do not allow special values PCS_INVALID_FD or AT_FDCWD, use pcs_sync_unlink() instead */
+
+	pcs_might_block();
+	int rc = unlinkat(dirfd, filename, 0) == 0 ? 0 : -errno;
+#ifdef USE_OPENAT_EMULATION
+	if (rc != -ENOSYS)
+		return rc;
+	char *path = pcs_pathat(dirfd, filename);
+	rc = pcs_sync_unlink(path);
+	pcs_free(path);
+#endif /* USE_OPENAT_EMULATION */
+	return rc;
+}
+
 int pcs_sync_rename(const char * oldpath, const char * newpath)
 {
 	pcs_might_block();
 	return rename(oldpath, newpath) == 0 ? 0 : -errno;
+}
+
+int pcs_sync_renameat(pcs_fd_t olddirfd, const char * oldname, pcs_fd_t newdirfd, const char * newname)
+{
+	BUG_ON(olddirfd < 0); /* Do not allow special values PCS_INVALID_FD or AT_FDCWD, use pcs_sync_rename() instead */
+	BUG_ON(newdirfd < 0);
+
+	pcs_might_block();
+	int rc = renameat(olddirfd, oldname, newdirfd, newname) == 0 ? 0 : -errno;
+#ifdef USE_OPENAT_EMULATION
+	if (rc != -ENOSYS)
+		return rc;
+	char *oldpath = pcs_pathat(olddirfd, oldname);
+	char *newpath = pcs_pathat(newdirfd, newname);
+	rc = pcs_sync_rename(oldpath, newpath);
+	pcs_free(newpath);
+	pcs_free(oldpath);
+#endif /* USE_OPENAT_EMULATION */
+	return rc;
 }
 
 int pcs_sync_lseek(pcs_fd_t fd, u64 offs, int origin, u64 *new_offs)
@@ -499,6 +657,30 @@ int pcs_sync_fstat(pcs_fd_t fd, struct pcs_stat *res)
 	return 0;
 }
 
+int pcs_sync_fstatat(pcs_fd_t dirfd, const char *filename, struct pcs_stat *res)
+{
+	BUG_ON(dirfd < 0); /* Do not allow special values PCS_INVALID_FD or AT_FDCWD, use pcs_sync_stat() instead */
+
+	struct stat st;
+
+	pcs_might_block();
+	if (fstatat(dirfd, filename, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+		pcs_stat2pcs(&st, res);
+		return 0;
+	}
+
+	int rc = -errno;
+#ifdef USE_OPENAT_EMULATION
+	if (rc != -ENOSYS)
+		return rc;
+	char *path = pcs_pathat(dirfd, filename);
+	rc = pcs_sync_stat(path, PCS_SYNC_NOFOLLOW, res);
+	pcs_free(path);
+#endif /* USE_OPENAT_EMULATION */
+	return rc;
+}
+
+
 void pcs_statvfs2pcs(const struct statvfs *st, struct pcs_statvfs *res)
 {
 	res->bsize = st->f_bsize;
@@ -547,7 +729,7 @@ int pcs_sync_create_lock_file(const char *path, pcs_fd_t *out_fd)
 	pcs_might_block();
 	lock_fname = pcs_xasprintf("%s.lck", path);
 
-	if ((lock_fd = open(lock_fname, O_CREAT | O_WRONLY, 0600)) < 0) {
+	if ((lock_fd = open(lock_fname, O_CREAT | O_WRONLY | O_CLOEXEC, 0600)) < 0) {
 		ret = -errno;
 		goto done;
 	}
@@ -905,10 +1087,10 @@ int pcs_sync_open(const char * pathname, int flags, int mode, pcs_fd_t * out_fd)
 	return 0;
 }
 
-int pcs_sync_openat(pcs_fd_t dirfd, const char * pathname, int flag, int mode, pcs_fd_t * out_fd)
+int pcs_sync_openat(pcs_fd_t dirfd, const char * filename, int flag, int mode, pcs_fd_t * out_fd)
 {
 	/* Windows has openat(): https://stackoverflow.com/a/32554138 */
-	pcs_fatal("pcs_sync_openat() not implemented on windows");
+	BUG(); // not implemented
 }
 
 int pcs_sync_close(pcs_fd_t fd)
@@ -929,6 +1111,11 @@ int pcs_sync_mkdir(const char *pathname, int mode)
 	return ret;
 }
 
+int pcs_sync_mkdirat(pcs_fd_t dirfd, const char *pathname, int mode)
+{
+	BUG(); // not implemented on Windows
+}
+
 int pcs_sync_rmdir(const char *pathname)
 {
 	WCHAR * w_pathname = pcs_utf8_to_utf16(pathname, -1);
@@ -941,6 +1128,11 @@ int pcs_sync_rmdir(const char *pathname)
 	return ret;
 }
 
+int pcs_sync_rmdirat(pcs_fd_t dirfd, const char *pathname)
+{
+	BUG(); // not implemented on Windows
+}
+
 int pcs_sync_unlink(const char * pathname)
 {
 	WCHAR * w_pathname = pcs_utf8_to_utf16(pathname, -1);
@@ -951,6 +1143,11 @@ int pcs_sync_unlink(const char * pathname)
 	int ret = DeleteFileW(w_pathname) ? 0 : -(int)GetLastError();
 	pcs_free(w_pathname);
 	return ret;
+}
+
+int pcs_sync_unlinkat(pcs_fd_t dirfd, const char * pathname, int flags)
+{
+	BUG(); // not implemented on Windows
 }
 
 int pcs_sync_rename(const char * oldname, const char * newname)
@@ -974,6 +1171,11 @@ int pcs_sync_rename(const char * oldname, const char * newname)
 	pcs_free(w_old);
 	pcs_free(w_new);
 	return err;
+}
+
+int pcs_sync_renameat(pcs_fd_t olddirfd, const char * oldpath, pcs_fd_t newdirfd, const char * newpath)
+{
+	BUG(); // not implemented on Windows
 }
 
 int pcs_sync_lseek(pcs_fd_t fd, u64 offs, int origin, u64 *new_offs)
@@ -1139,6 +1341,11 @@ int pcs_sync_fstat(pcs_fd_t fd, struct pcs_stat *res)
 	res->gid = 0;
 
 	return 0;
+}
+
+int pcs_sync_fstatat(pcs_fd_t dirfd, const char *path, int flags, struct pcs_stat *res)
+{
+	BUG(); // not implemented on Windows
 }
 
 int pcs_sync_statvfs(const char *path, struct pcs_statvfs *res)

@@ -27,9 +27,13 @@ PCS_API int pcs_sync_open(const char * pathname, int flag, int mode, pcs_fd_t * 
 PCS_API int pcs_sync_openat(pcs_fd_t dirfd, const char * pathname, int flag, int mode, pcs_fd_t * out_fd);
 PCS_API int pcs_sync_close(pcs_fd_t fd);
 PCS_API int pcs_sync_mkdir(const char *pathname, int mode);
+PCS_API int pcs_sync_mkdirat(pcs_fd_t dirfd, const char *filename, int mode);
 PCS_API int pcs_sync_rmdir(const char *pathname);
+PCS_API int pcs_sync_rmdirat(pcs_fd_t dirfd, const char *filename);
 PCS_API int pcs_sync_unlink(const char * pathname);
+PCS_API int pcs_sync_unlinkat(pcs_fd_t dirfd, const char * filename, int flags);
 PCS_API int pcs_sync_rename(const char * oldpath, const char * newpath);
+PCS_API int pcs_sync_renameat(pcs_fd_t olddirfd, const char * oldname, pcs_fd_t newdirfd, const char * newname);
 PCS_API int pcs_sync_lseek(pcs_fd_t fd, u64 offs, int origin, u64 *new_offs);
 PCS_API int pcs_sync_ioctl(pcs_fd_t fd, unsigned long int cmd, void *data);
 /* Try to lock or unlock file range.
@@ -46,6 +50,7 @@ struct pcs_stat;
 #define PCS_SYNC_NOFOLLOW (1 << 0)
 PCS_API int pcs_sync_stat(const char *path, int flags, struct pcs_stat *res);
 PCS_API int pcs_sync_fstat(pcs_fd_t fd, struct pcs_stat *res);
+PCS_API int pcs_sync_fstatat(pcs_fd_t dirfd, const char *filename, struct pcs_stat *res);
 void pcs_stat2pcs(const struct stat *st, struct pcs_stat *res);
 
 struct statvfs;
@@ -72,5 +77,8 @@ void pcs_statvfs2pcs(const struct statvfs *st, struct pcs_statvfs *res);
 PCS_API pcs_fd_t pcs_stdin_fd(void);
 PCS_API pcs_fd_t pcs_stdout_fd(void);
 PCS_API pcs_fd_t pcs_stderr_fd(void);
+
+/* Internal function. Not exported */
+char *pcs_pathat(pcs_fd_t dirfd, const char *pathname);
 
 #endif /* _PCS_SYNC_IO_H_ */

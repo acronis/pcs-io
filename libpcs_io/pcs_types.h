@@ -53,7 +53,7 @@ typedef int8_t s8;
 /* NOTE: use '__restrict' instead of C99 'restrict' as it is supported by all of: gcc, clang, msvc */
 #if defined(__GNUC__) || defined(__clang__)
 
-#define __printf(x,y)		__attribute__((format(printf, x, y)))
+#define __printf(x,y)		__attribute__((format(printf, x, y), nonnull(x)))
 #define __noreturn		__attribute__((noreturn))
 #define __noinline		__attribute__((noinline))
 #define __maybe_unused		__attribute__((unused))
@@ -131,9 +131,12 @@ typedef struct __pre_aligned(8) _PCS_NODE_ID_T {
 	u64    val;
 } PCS_NODE_ID_T __aligned(8);
 
-typedef struct {
-	u32 major;
-	u32 minor;
+typedef union {
+	struct {
+		u32 major;
+		u32 minor;
+	};
+	u64 full;
 } PCS_FAST_PATH_VERSION_T;
 
 #endif /* __PCS_TYPES_H__ */

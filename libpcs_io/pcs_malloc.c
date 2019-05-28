@@ -55,7 +55,6 @@ void __noinline pcs_malloc_failed(const char *file)
 	BUG();
 }
 
-#define PAGE_SIZE 4096
 #define pcs_get_size(size) (intptr_t)(size)
 
 static pthread_mutex_t global_mutex = PTHREAD_MUTEX_INITIALIZER;

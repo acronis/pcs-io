@@ -19,7 +19,7 @@ void pcs_ucontext_switch(struct pcs_ucontext *save, struct pcs_ucontext *load);
 
 #else /* __WINDOWS__ */
 
-#if (defined(__LINUX__) || defined(__MAC__) || defined(__SUN__)) && (defined(__i386__) || defined(__x86_64__))
+#if (defined(__LINUX__) || defined(__MAC__) || defined(__SUN__)) && (defined(__i386__) || defined(__x86_64__) || defined(__aarch64__))
 
 struct pcs_ucontext {
 	void	*sp;
@@ -29,8 +29,10 @@ void pcs_ucontext_switch(struct pcs_ucontext *save, struct pcs_ucontext *load);
 
 #ifdef __x86_64__
 #define PCS_UCONTEXT_TOPMOST	__asm__ __volatile__(".cfi_undefined rip")
-#else
+#elif defined(__i386__)
 #define PCS_UCONTEXT_TOPMOST	__asm__ __volatile__(".cfi_undefined eip")
+#elif defined(__aarch64__)
+#define PCS_UCONTEXT_TOPMOST	__asm__ __volatile__(".cfi_undefined x30")
 #endif
 
 #else

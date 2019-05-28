@@ -41,7 +41,7 @@ static struct pcs_splice_buf * create_new_splice_buf(struct pcs_splice_pool * po
 	}
 
 	while (1) {
-		desc = open(name, O_RDWR|O_NONBLOCK);
+		desc = open(name, O_RDWR | O_NONBLOCK | O_CLOEXEC);
 		if (desc >= 0)
 			break;
 
@@ -576,7 +576,7 @@ void pcs_splice_pool_init(struct pcs_process * proc, struct pcs_splice_pool * po
 	pool->free_count = 0;
 	pool->total_count = 0;
 	if (enable) {
-		pool->drain_fd = open("/dev/null", O_WRONLY);
+		pool->drain_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
 		BUG_ON(pool->drain_fd < 0);
 	} else {
 		pool->drain_fd = -1;
@@ -623,7 +623,81 @@ void pcs_splice_pool_enable(struct pcs_splice_pool * pool)
 		return;
 	}
 	if (pool->drain_fd < 0)
-		pool->drain_fd = open("/dev/null", O_WRONLY);
+		pool->drain_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
 }
 
-#endif
+#else /* HAS_LINUX_SPLICE */
+
+struct pcs_splice_buf * pcs_splice_buf_alloc(struct pcs_splice_pool * pool)
+{
+	return NULL;
+}
+
+unsigned int pcs_splice_buf_bytes(struct pcs_splice_buf * b)
+{
+	BUG();
+}
+
+struct pcs_splice_buf * pcs_splice_buf_cut(struct pcs_splice_buf * b, int offset, int size)
+{
+	BUG();
+}
+
+void pcs_splice_buf_free(struct pcs_splice_buf * b)
+{
+	BUG();
+}
+
+struct pcs_splice_buf * pcs_splice_buf_get(struct pcs_splice_buf * b)
+{
+	BUG();
+}
+
+int pcs_splice_buf_getbytes(struct pcs_splice_buf * b, char * buf, int size)
+{
+	BUG();
+}
+
+void pcs_splice_buf_put(struct pcs_splice_buf * b)
+{
+	BUG();
+}
+
+int pcs_splice_buf_recv(struct pcs_splice_buf * b, int fd, int size)
+{
+	BUG();
+}
+
+int pcs_splice_buf_send(int fd, struct pcs_splice_buf * b, int size)
+{
+	BUG();
+}
+
+int pcs_splice_buf_vm(struct pcs_splice_buf * b, void * addr, int len)
+{
+	BUG();
+}
+
+void pcs_splice_bufs_add(struct cd_list * bufs, struct pcs_splice_buf * sb)
+{
+	BUG();
+}
+
+void pcs_splice_bufs_desplice(struct cd_list * bufs)
+{
+	BUG_ON(!cd_list_empty(bufs));
+}
+
+void pcs_splice_pool_init(struct pcs_process * proc, struct pcs_splice_pool * pool, int enable)
+{
+}
+
+void pcs_splice_pool_fini(struct pcs_splice_pool * pool)
+{
+}
+
+void pcs_splice_pool_permanently_disable(struct pcs_splice_pool * pool)
+{
+}
+
+#endif /* HAS_LINUX_SPLICE */
